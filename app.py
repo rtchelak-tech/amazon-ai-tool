@@ -1,11 +1,25 @@
+Here is the complete, fully assembled code for your app.py file.
+
+This version combines:
+
+The "Supercharged" Tab 1 (Inventory Health, Stockout Alerts, 80/20 Rule, Price Wars).
+
+The Working Tab 2 (Lost Money & Reimbursements).
+
+The placeholders for Tabs 3, 4, and 5.
+
+You can delete everything in your current file and paste this entire block:
+
+Python
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-# --- Page Configuration ---
+# --- PAGE CONFIGURATION ---
 st.set_page_config(page_title="FBA Command Center", layout="wide", initial_sidebar_state="expanded")
 
-# --- Custom Styling ---
+# --- CUSTOM STYLING ---
 st.markdown("""
     <style>
     .main { background-color: #f9f9fb; }
@@ -18,21 +32,25 @@ with st.sidebar:
     st.image("https://upload.wikimedia.org/wikipedia/commons/a/a9/Amazon_logo.svg", width=100) 
     st.title("FBA Assistant 🤖")
     st.write("Upload reports to unlock modules.")
+    
     st.divider()
+    
     st.info("💡 **Quick Guide**")
     st.markdown("""
     **Tab 1: Inventory Health**
     *File:* `FBA Inventory`
-    *New:* Stockout Alerts & Dead Stock.
+    *Insights:* Stockouts, Dead Stock, Pricing.
     
     **Tab 2: Lost Money**
     *File:* `Reimbursements`
-    *Goal:* Recovery Audit.
+    *Insights:* Recovery Audit.
     """)
-    st.caption("v2.2 - Health Upgrade")
+    st.caption("v2.3 - Full Suite")
 
+# --- MAIN APP ---
 st.title("🚀 Amazon FBA Command Center")
 
+# Create the Tabs
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📦 Inventory Health", 
     "💸 Lost Money & Reimbursements", 
@@ -42,131 +60,111 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # ==========================================
-# TAB 1: INVENTORY HEALTH (UPGRADED)
+# TAB 1: INVENTORY HEALTH (SUPERCHARGED)
 # ==========================================
 with tab1:
-    st.header("Inventory Health & Restock Alerts")
-    st.markdown("Optimize your storage fees and prevent stockouts.")
+    st.header("Inventory Health & Market Analysis")
+    st.markdown("Deep dive into Stockouts, Pricing, and Amazon's Recommendations.")
     
     uploaded_inv = st.file_uploader("Upload 'FBA Inventory' (CSV)", type=['csv'], key="inv_upload")
     
     if uploaded_inv:
-        # --- 1. LOAD & CLEAN ---
         try:
+            # --- 1. LOAD & CLEAN ---
             df = pd.read_csv(uploaded_inv)
-            # Standardize columns: lowercase, strip spaces, replace spaces with hyphens to match Amazon format
+            # Standardize columns: lowercase, strip spaces
             df.columns = df.columns.str.strip().str.lower()
             
-            # Helper to safely convert columns to numbers
+            # Helper: Safely convert to number
             def safe_float(col):
                 if col in df.columns:
                     return pd.to_numeric(df[col], errors='coerce').fillna(0)
                 return 0
 
-            # --- 2. EXTRACT METRICS ---
-            # Identify columns (Amazon changes names often, so we check for variations)
-            # Quantity
-            if 'afn-fulfillable-quantity' in df.columns:
-                df['qty'] = df['afn-fulfillable-quantity']
-            elif 'available' in df.columns: # Sometimes it's just 'available'
-                df['qty'] = df['available']
-            else:
-                df['qty'] = safe_float('available-quantity(sellable)')
-
-            # Sales Velocity (30 Days)
-            # Note: Health reports usually have 'units-shipped-last-30-days'
+            # --- 2. MAP COLUMNS ---
+            # We map standard columns to easy variable names
+            df['qty'] = df['afn-fulfillable-quantity'] if 'afn-fulfillable-quantity' in df.columns else safe_float('available-quantity(sellable)')
             df['sales_30'] = safe_float('units-shipped-last-30-days')
-            
-            # Financials
             df['price'] = safe_float('your-price')
+            df['competitor_price'] = safe_float('lowest-price-new-plus-shipping')
             df['fees'] = safe_float('estimated-storage-cost-next-month')
             
-            # Aging
-            df['age_365'] = safe_float('inv-age-365-plus-days')
-            df['age_181_330'] = safe_float('inv-age-181-to-330-days')
+            # --- 3. CALCULATE METRICS ---
+            total_stock = df['qty'].sum()
+            est_revenue = (df['qty'] * df['price']).sum()
             
-            # --- 3. CALCULATE NEW INSIGHTS ---
-            
-            # A. DAYS OF SUPPLY (DoS)
-            # DoS = Current Stock / (Sales last 30 days / 30)
-            # Avoid division by zero
+            # A. Stockout Risk (Days of Supply)
             df['daily_velocity'] = df['sales_30'] / 30
             df['days_of_supply'] = df.apply(lambda x: x['qty'] / x['daily_velocity'] if x['daily_velocity'] > 0 else 999, axis=1)
 
-            # B. POTENTIAL REVENUE
-            df['potential_revenue'] = df['qty'] * df['price']
-
-            # --- 4. DISPLAY TOP-LEVEL METRICS ---
-            total_stock = df['qty'].sum()
-            est_revenue = df['potential_revenue'].sum()
-            total_fees = df['fees'].sum()
-            
+            # --- 4. DISPLAY TOP STATS ---
             m1, m2, m3 = st.columns(3)
-            m1.metric("Total Units in FBA", f"{int(total_stock):,}")
+            m1.metric("Total Units", f"{int(total_stock):,}")
             m2.metric("Est. Revenue Value", f"${est_revenue:,.2f}")
-            m3.metric("Est. Monthly Storage Fee", f"${total_fees:,.2f}", delta="Minimize This", delta_color="inverse")
+            m3.metric("Monthly Storage Fees", f"${df['fees'].sum():,.2f}", delta="Minimize This", delta_color="inverse")
 
             st.divider()
 
-            # --- 5. ACTIONABLE ALERTS (THE NEW STUFF) ---
-            
+            # --- 5. STOCKOUTS & DEAD STOCK ---
             c1, c2 = st.columns(2)
-            
             with c1:
-                st.subheader("🚨 Restock Alerts (Low Stock)")
-                st.caption("Items with < 21 Days of Supply (High Sales Velocity)")
-                
-                # Filter: Velocity > 0 AND Days of Supply < 21
-                restock_df = df[(df['sales_30'] > 0) & (df['days_of_supply'] < 21)].copy()
-                restock_df = restock_df.sort_values('days_of_supply')
-                
+                st.subheader("🚨 Stockout Risk")
+                st.caption("Items with < 21 Days of Supply")
+                restock_df = df[(df['sales_30'] > 0) & (df['days_of_supply'] < 21)].sort_values('days_of_supply')
                 if not restock_df.empty:
-                    st.dataframe(
-                        restock_df[['sku', 'qty', 'sales_30', 'days_of_supply']].head(10).style.format({'days_of_supply': "{:.1f}"}),
-                        use_container_width=True
-                    )
+                    st.dataframe(restock_df[['sku', 'qty', 'sales_30', 'days_of_supply']].head(10).style.format({'days_of_supply': "{:.1f}"}), use_container_width=True)
                 else:
-                    st.success("No immediate stockout risks found!")
+                    st.success("No immediate stockout risks!")
 
             with c2:
-                st.subheader("🐢 Dead Stock Candidates")
-                st.caption("Items with > 10 units but ZERO sales in 30 days.")
-                
-                # Filter: Qty > 10 AND Sales_30 == 0
-                dead_df = df[(df['qty'] > 10) & (df['sales_30'] == 0)].copy()
-                dead_df = dead_df.sort_values('qty', ascending=False)
-                
+                st.subheader("🐢 Dead Stock")
+                st.caption("Qty > 10 but ZERO sales in 30 days")
+                dead_df = df[(df['qty'] > 10) & (df['sales_30'] == 0)].sort_values('qty', ascending=False)
                 if not dead_df.empty:
                     st.dataframe(dead_df[['sku', 'product-name', 'qty', 'fees']].head(10), use_container_width=True)
                 else:
-                    st.success("No dead stock found. Great job!")
+                    st.success("No dead stock found!")
 
-            # --- 6. AGING INVENTORY VISUAL ---
             st.divider()
-            st.subheader("⏳ Inventory Age Distribution")
-            
-            # We want to see how much stock is sitting in each age bucket
-            age_cols = ['inv-age-0-to-90-days', 'inv-age-91-to-180-days', 'inv-age-181-to-330-days', 'inv-age-331-to-365-days', 'inv-age-365-plus-days']
-            
-            # Check which columns actually exist in the file
-            present_age_cols = [c for c in age_cols if c in df.columns]
-            
-            if present_age_cols:
-                # Sum them up for the chart
-                age_sums = df[present_age_cols].sum().reset_index()
-                age_sums.columns = ['Age Group', 'Units']
+
+            # --- 6. THE 80/20 RULE (PARETO) ---
+            st.subheader("🏆 The 'Hero' Products (80/20 Rule)")
+            if df['sales_30'].sum() > 0:
+                sorted_df = df.sort_values(by='sales_30', ascending=False)
+                sorted_df['cumulative_sales'] = sorted_df['sales_30'].cumsum()
+                sorted_df['cumulative_perc'] = 100 * sorted_df['cumulative_sales'] / sorted_df['sales_30'].sum()
+                top_performers = sorted_df[sorted_df['cumulative_perc'] <= 80]
                 
-                fig = px.bar(age_sums, x='Age Group', y='Units', title="Inventory Units by Age Group", color='Age Group')
-                st.plotly_chart(fig, use_container_width=True)
+                c_pie, c_stat = st.columns([1, 2])
+                with c_pie:
+                    sales_data = pd.DataFrame({
+                        'Type': ['Hero Products (80% Vol)', 'Others (20% Vol)'],
+                        'Sales': [top_performers['sales_30'].sum(), df['sales_30'].sum() - top_performers['sales_30'].sum()]
+                    })
+                    fig_pie = px.pie(sales_data, values='Sales', names='Type', hole=0.4)
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                with c_stat:
+                    st.write(f"**{len(top_performers)} SKUs** are generating 80% of your sales volume.")
+                    st.dataframe(top_performers[['sku', 'product-name', 'sales_30', 'price']].head(5), use_container_width=True)
+
+            # --- 7. PRICE WAR ---
+            st.subheader("🏷️ Price Competitiveness")
+            if 'competitor_price' in df.columns and df['competitor_price'].sum() > 0:
+                df['price_diff'] = df['price'] - df['competitor_price']
+                overpriced = df[(df['qty'] > 0) & (df['price_diff'] > 0)].sort_values('price_diff', ascending=False)
+                if not overpriced.empty:
+                    st.warning(f"⚠️ You are priced higher on **{len(overpriced)} products**.")
+                    st.dataframe(overpriced[['sku', 'price', 'competitor_price', 'price_diff']].head(5), use_container_width=True)
+                else:
+                    st.success("✅ Your pricing is competitive!")
             else:
-                st.warning("Inventory Age columns not found in this report. (Try downloading the 'FBA Inventory Health' report specifically).")
+                st.info("Pricing columns not detected (Need 'lowest-price-new-plus-shipping').")
 
         except Exception as e:
             st.error(f"Error processing inventory file: {e}")
-            st.write("Debug - Columns found:", df.columns.tolist())
 
     else:
-        st.info("👋 Upload your **FBA Inventory** (or Inventory Health) CSV to see Stockout & Dead Stock analysis.")
+        st.info("👋 Upload your **FBA Inventory Health** CSV to unlock Price Wars & 80/20 Analysis.")
 
 # ==========================================
 # TAB 2: LOST MONEY & REIMBURSEMENTS
@@ -179,7 +177,7 @@ with tab2:
     inventory_upload = c1.file_uploader("1. Upload 'Inventory Ledger' (CSV)", type=['csv'], key="ledger_up")
     reimbursement_upload = c2.file_uploader("2. Upload 'Reimbursements' (CSV)", type=['csv'], key="reimb_up")
     
-    # LOGIC 1: Process Reimbursements
+    # LOGIC: Process Reimbursements
     if reimbursement_upload:
         try:
             df_reim = pd.read_csv(reimbursement_upload)
@@ -203,6 +201,8 @@ with tab2:
                 reason_counts = df_reim.groupby('reason')['amount-total'].sum().reset_index()
                 fig_reim = px.bar(reason_counts, x='reason', y='amount-total', title="Reimbursements by Reason", color='amount-total')
                 st.plotly_chart(fig_reim, use_container_width=True)
+                
+            st.dataframe(df_reim.head())
             
         except Exception as e:
             st.error(f"Error reading Reimbursements file: {e}")
