@@ -13,37 +13,26 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# --- SIDEBAR: The "Guidance" System ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.image("https://upload.wikimedia.org/wikipedia/commons/a/a9/Amazon_logo.svg", width=100) 
     st.title("FBA Assistant 🤖")
     st.write("Upload reports to unlock modules.")
-    
     st.divider()
-    
-    # Dynamic Help Section
     st.info("💡 **Quick Guide**")
     st.markdown("""
-    **1. Inventory Health**
+    **Tab 1: Inventory Health**
     *File:* `FBA Inventory`
-    *Goal:* Fix fees & excess stock.
+    *New:* Stockout Alerts & Dead Stock.
     
-    **2. Returns Analysis**
-    *File:* `FBA Customer Returns`
-    *Goal:* Find product defects.
-    
-    **3. True Inventory (Beta)**
-    *Files:* `Inventory Ledger`, `Removals`
-    *Goal:* Track lost units.
+    **Tab 2: Lost Money**
+    *File:* `Reimbursements`
+    *Goal:* Recovery Audit.
     """)
-    
-    st.divider()
-    st.caption("v2.0 - Command Center Edition")
+    st.caption("v2.2 - Health Upgrade")
 
-# --- MAIN APP: The "5-Tab Suite" ---
 st.title("🚀 Amazon FBA Command Center")
 
-# Create the Tabs for the different Modules
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📦 Inventory Health", 
     "💸 Lost Money & Reimbursements", 
@@ -53,134 +42,155 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # ==========================================
-# MODULE 1: INVENTORY HEALTH (Fully Working)
+# TAB 1: INVENTORY HEALTH (UPGRADED)
 # ==========================================
 with tab1:
-    st.header("Inventory Health & Storage Fees")
-    uploaded_inv = st.file_uploader("Upload 'FBA Inventory Health' CSV", type=['csv'], key="inv_upload")
+    st.header("Inventory Health & Restock Alerts")
+    st.markdown("Optimize your storage fees and prevent stockouts.")
+    
+    uploaded_inv = st.file_uploader("Upload 'FBA Inventory' (CSV)", type=['csv'], key="inv_upload")
     
     if uploaded_inv:
-        # Load & Clean Data
-        df = pd.read_csv(uploaded_inv)
-        # Normalize column names just in case
-        df.columns = df.columns.str.strip().str.lower()
-        
-        numeric_cols = ['estimated-excess-quantity', 'your-price', 'estimated-storage-cost-next-month', 'inv-age-365-plus-days']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-        
-        # Calculate Metrics
-        excess_val = (df['estimated-excess-quantity'] * df['your-price']).sum() if 'estimated-excess-quantity' in df.columns else 0
-        storage_cost = df['estimated-storage-cost-next-month'].sum() if 'estimated-storage-cost-next-month' in df.columns else 0
-        aged_units = df['inv-age-365-plus-days'].sum() if 'inv-age-365-plus-days' in df.columns else 0
-
-        # Display Metrics
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Trapped Capital (Excess)", f"${excess_val:,.2f}", delta="Needs Liquidation", delta_color="inverse")
-        c2.metric("Next Month Storage Fees", f"${storage_cost:,.2f}", delta="- Minimize This", delta_color="inverse")
-        c3.metric("Aged Units (365+ Days)", f"{int(aged_units)}", delta="LTSF Risk", delta_color="inverse")
-
-        # Visuals
-        st.subheader("Where is your money stuck?")
-        if 'estimated-excess-quantity' in df.columns:
-            df['excess_val'] = df['estimated-excess-quantity'] * df['your-price']
-            top_excess = df.sort_values(by='excess_val', ascending=False).head(10)
-            fig = px.bar(top_excess, x='excess_val', y='sku', orientation='h', title="Top 10 SKUs by Excess Value", color='excess_val')
-            st.plotly_chart(fig, use_container_width=True)
+        # --- 1. LOAD & CLEAN ---
+        try:
+            df = pd.read_csv(uploaded_inv)
+            # Standardize columns: lowercase, strip spaces, replace spaces with hyphens to match Amazon format
+            df.columns = df.columns.str.strip().str.lower()
             
-        # Action List
-        st.subheader("📋 Recommended Actions")
-        if 'recommended-action' in df.columns:
-             st.dataframe(df[['sku', 'product-name', 'recommended-action', 'estimated-storage-cost-next-month']], use_container_width=True)
+            # Helper to safely convert columns to numbers
+            def safe_float(col):
+                if col in df.columns:
+                    return pd.to_numeric(df[col], errors='coerce').fillna(0)
+                return 0
+
+            # --- 2. EXTRACT METRICS ---
+            # Identify columns (Amazon changes names often, so we check for variations)
+            # Quantity
+            if 'afn-fulfillable-quantity' in df.columns:
+                df['qty'] = df['afn-fulfillable-quantity']
+            elif 'available' in df.columns: # Sometimes it's just 'available'
+                df['qty'] = df['available']
+            else:
+                df['qty'] = safe_float('available-quantity(sellable)')
+
+            # Sales Velocity (30 Days)
+            # Note: Health reports usually have 'units-shipped-last-30-days'
+            df['sales_30'] = safe_float('units-shipped-last-30-days')
+            
+            # Financials
+            df['price'] = safe_float('your-price')
+            df['fees'] = safe_float('estimated-storage-cost-next-month')
+            
+            # Aging
+            df['age_365'] = safe_float('inv-age-365-plus-days')
+            df['age_181_330'] = safe_float('inv-age-181-to-330-days')
+            
+            # --- 3. CALCULATE NEW INSIGHTS ---
+            
+            # A. DAYS OF SUPPLY (DoS)
+            # DoS = Current Stock / (Sales last 30 days / 30)
+            # Avoid division by zero
+            df['daily_velocity'] = df['sales_30'] / 30
+            df['days_of_supply'] = df.apply(lambda x: x['qty'] / x['daily_velocity'] if x['daily_velocity'] > 0 else 999, axis=1)
+
+            # B. POTENTIAL REVENUE
+            df['potential_revenue'] = df['qty'] * df['price']
+
+            # --- 4. DISPLAY TOP-LEVEL METRICS ---
+            total_stock = df['qty'].sum()
+            est_revenue = df['potential_revenue'].sum()
+            total_fees = df['fees'].sum()
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Units in FBA", f"{int(total_stock):,}")
+            m2.metric("Est. Revenue Value", f"${est_revenue:,.2f}")
+            m3.metric("Est. Monthly Storage Fee", f"${total_fees:,.2f}", delta="Minimize This", delta_color="inverse")
+
+            st.divider()
+
+            # --- 5. ACTIONABLE ALERTS (THE NEW STUFF) ---
+            
+            c1, c2 = st.columns(2)
+            
+            with c1:
+                st.subheader("🚨 Restock Alerts (Low Stock)")
+                st.caption("Items with < 21 Days of Supply (High Sales Velocity)")
+                
+                # Filter: Velocity > 0 AND Days of Supply < 21
+                restock_df = df[(df['sales_30'] > 0) & (df['days_of_supply'] < 21)].copy()
+                restock_df = restock_df.sort_values('days_of_supply')
+                
+                if not restock_df.empty:
+                    st.dataframe(
+                        restock_df[['sku', 'qty', 'sales_30', 'days_of_supply']].head(10).style.format({'days_of_supply': "{:.1f}"}),
+                        use_container_width=True
+                    )
+                else:
+                    st.success("No immediate stockout risks found!")
+
+            with c2:
+                st.subheader("🐢 Dead Stock Candidates")
+                st.caption("Items with > 10 units but ZERO sales in 30 days.")
+                
+                # Filter: Qty > 10 AND Sales_30 == 0
+                dead_df = df[(df['qty'] > 10) & (df['sales_30'] == 0)].copy()
+                dead_df = dead_df.sort_values('qty', ascending=False)
+                
+                if not dead_df.empty:
+                    st.dataframe(dead_df[['sku', 'product-name', 'qty', 'fees']].head(10), use_container_width=True)
+                else:
+                    st.success("No dead stock found. Great job!")
+
+            # --- 6. AGING INVENTORY VISUAL ---
+            st.divider()
+            st.subheader("⏳ Inventory Age Distribution")
+            
+            # We want to see how much stock is sitting in each age bucket
+            age_cols = ['inv-age-0-to-90-days', 'inv-age-91-to-180-days', 'inv-age-181-to-330-days', 'inv-age-331-to-365-days', 'inv-age-365-plus-days']
+            
+            # Check which columns actually exist in the file
+            present_age_cols = [c for c in age_cols if c in df.columns]
+            
+            if present_age_cols:
+                # Sum them up for the chart
+                age_sums = df[present_age_cols].sum().reset_index()
+                age_sums.columns = ['Age Group', 'Units']
+                
+                fig = px.bar(age_sums, x='Age Group', y='Units', title="Inventory Units by Age Group", color='Age Group')
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Inventory Age columns not found in this report. (Try downloading the 'FBA Inventory Health' report specifically).")
+
+        except Exception as e:
+            st.error(f"Error processing inventory file: {e}")
+            st.write("Debug - Columns found:", df.columns.tolist())
+
     else:
-        st.info("👋 Upload your **FBA Inventory** file to see this data.")
+        st.info("👋 Upload your **FBA Inventory** (or Inventory Health) CSV to see Stockout & Dead Stock analysis.")
 
 # ==========================================
-# MODULE 2: LOST MONEY (NOW WORKING!)
+# TAB 2: LOST MONEY & REIMBURSEMENTS
 # ==========================================
 with tab2:
     st.header("Lost Inventory & Reimbursements")
-    st.markdown("Find units Amazon lost/damaged but didn't pay you for.")
+    st.markdown("Analyze how much Amazon has paid you back vs. what is still missing.")
     
     c1, c2 = st.columns(2)
-    # Note: We use the Inventory Ledger for 'Lost' items
-    inventory_upload = c1.file_uploader("1. Upload 'Inventory Ledger' (CSV)", type=['csv'], key="reimb")
-    reimbursement_upload = c2.file_uploader("2. Upload 'Reimbursements' Report (CSV)", type=['csv'], key="adj")
+    inventory_upload = c1.file_uploader("1. Upload 'Inventory Ledger' (CSV)", type=['csv'], key="ledger_up")
+    reimbursement_upload = c2.file_uploader("2. Upload 'Reimbursements' (CSV)", type=['csv'], key="reimb_up")
     
-    if inventory_upload and reimbursement_upload:
-        st.success("Files received! Running audit...")
-        
+    # LOGIC 1: Process Reimbursements
+    if reimbursement_upload:
         try:
-            # --- 1. LOAD DATA ---
-            df_inv = pd.read_csv(inventory_upload)
             df_reim = pd.read_csv(reimbursement_upload)
-            
-            # --- 2. NORMALIZE COLUMNS ---
-            # Clean up column names (strip spaces, lowercase) to match Amazon's changing formats
-            df_inv.columns = df_inv.columns.str.strip().str.lower()
             df_reim.columns = df_reim.columns.str.strip().str.lower()
-            
-            # --- 3. CONVERT DATES ---
-            # We use 'errors=coerce' so if a date is weird, it doesn't crash the app
-            if 'date' in df_inv.columns:
-                df_inv['date'] = pd.to_datetime(df_inv['date'], errors='coerce')
             
             if 'approval-date' in df_reim.columns:
                 df_reim['approval-date'] = pd.to_datetime(df_reim['approval-date'], errors='coerce')
-            
-            # --- 4. DISPLAY RESULTS ---
+            if 'amount-total' in df_reim.columns:
+                df_reim['amount-total'] = pd.to_numeric(df_reim['amount-total'], errors='coerce').fillna(0)
+
             st.divider()
-            st.write(f"✅ **Loaded Data Successfully**")
-            st.write(f"**Inventory Ledger:** {len(df_inv)} rows found.")
-            st.write(f"**Reimbursements:** {len(df_reim)} rows found.")
+            st.subheader("✅ Money Recovered (from file)")
             
-            st.subheader("Data Preview")
-            st.dataframe(df_inv.head())
-            
-            # Future Logic: Here is where we will compare df_inv (Lost) vs df_reim (Paid)
-            
-        except Exception as e:
-            st.error(f"Error processing files: {e}")
-    else:
-        st.warning("Please upload both files to run the audit.")
-
-# ==========================================
-# MODULE 3: RETURNS ANALYSIS (Placeholder)
-# ==========================================
-with tab3:
-    st.header("Voice of the Customer (Returns)")
-    returns_file = st.file_uploader("Upload 'FBA Customer Returns' Report", type=['csv'], key="ret")
-    
-    if returns_file:
-        st.write("Analyzing return reasons...")
-        # Logic to scan 'customer-comments' column would go here
-    else:
-        st.info("Upload returns file to detect product defects.")
-
-# ==========================================
-# MODULE 4: TRUE INVENTORY (The Lifecycle)
-# ==========================================
-with tab4:
-    st.header("True Inventory Lifecycle")
-    st.markdown("Reconcile shipments, sales, and warehouse transfers.")
-    ledger_file = st.file_uploader("Upload 'Inventory Ledger' (View: Daily)", type=['csv'], key="ledg")
-    
-    if ledger_file:
-        st.write("Tracking lifecycle...")
-        # Logic to map Inbound -> Sold -> Returned -> Removal would go here
-    else:
-        st.info("Upload the Daily Ledger to track 'Ghost' Inventory.")
-
-# ==========================================
-# MODULE 5: FINANCIALS (Placeholder)
-# ==========================================
-with tab5:
-    st.header("Net Profit Calculator")
-    settlement_file = st.file_uploader("Upload 'Settlement Report' (Flat File V2)", type=['csv'], key="fin")
-    
-    if settlement_file:
-        st.write("Calculating true margins...")
-        # Logic to subtract fees/refunds from sales would go here
-    else:
-        st.info("See your true pocket profit after all Amazon fees.")
+            total_recovered
