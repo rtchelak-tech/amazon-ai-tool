@@ -193,4 +193,40 @@ with tab2:
             st.divider()
             st.subheader("✅ Money Recovered (from file)")
             
-            total_recovered
+            total_recovered = df_reim['amount-total'].sum()
+            
+            m1, m2 = st.columns(2)
+            m1.metric("Total Reimbursed", f"${total_recovered:,.2f}")
+            m2.metric("Total Cases/Rows", f"{len(df_reim)}")
+
+            if 'reason' in df_reim.columns:
+                reason_counts = df_reim.groupby('reason')['amount-total'].sum().reset_index()
+                fig_reim = px.bar(reason_counts, x='reason', y='amount-total', title="Reimbursements by Reason", color='amount-total')
+                st.plotly_chart(fig_reim, use_container_width=True)
+            
+        except Exception as e:
+            st.error(f"Error reading Reimbursements file: {e}")
+
+    if inventory_upload and reimbursement_upload:
+        st.info("🔄 Comparison Logic: Upload 'Inventory Ledger' to match lost units against these payments.")
+
+# ==========================================
+# TAB 3: RETURNS (Placeholder)
+# ==========================================
+with tab3:
+    st.header("Voice of the Customer (Returns)")
+    st.info("Coming soon: Upload 'FBA Customer Returns' to see return reasons.")
+
+# ==========================================
+# TAB 4: TRUE INVENTORY (Placeholder)
+# ==========================================
+with tab4:
+    st.header("True Inventory Lifecycle")
+    st.info("Coming soon: Upload 'Inventory Ledger' to track lost units.")
+
+# ==========================================
+# TAB 5: NET PROFIT (Placeholder)
+# ==========================================
+with tab5:
+    st.header("Net Profit Calculator")
+    st.info("Coming soon: Upload 'Settlement Report' to see true margins.")
