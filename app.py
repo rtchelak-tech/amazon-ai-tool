@@ -149,3 +149,77 @@ with tab5:
         # Logic to subtract fees/refunds from sales would go here
     else:
         st.info("See your true pocket profit after all Amazon fees.")
+        import pandas as pd
+
+# --- CONFIGURATION ---
+inventory_file = 'inventory_ledger.csv'      # Download for: Dec 1 - Dec 31
+reimbursement_file = 'reimbursements.csv'    # Download for: Dec 1 - TODAY
+
+# Define the period you want to AUDIT (The Inventory dates)
+TARGET_MONTH_START = '2025-12-01'
+TARGET_MONTH_END = '2025-12-31'
+
+# --- STEP 1: LOAD DATA ---
+df_inv = pd.read_csv(inventory_file)
+df_reim = pd.read_csv(reimbursement_file)
+
+# Normalize columns
+df_inv.columns = df_inv.columns.str.strip().str.lower()
+df_reim.columns = df_reim.columns.str.strip().str.lower()
+
+# Convert to datetime
+df_inv['date'] = pd.to_datetime(df_inv['date'])
+df_reim['approval-date'] = pd.to_datetime(df_reim['approval-date'])
+
+# --- STEP 2: SMART FILTERING ---
+
+# 1. Filter Inventory STRICTLY to the target month
+mask_inv = (df_inv['date'] >= TARGET_MONTH_START) & (df_inv['date'] <= TARGET_MONTH_END)
+df_inv = df_inv.loc[mask_inv].copy()
+
+# 2. Filter Reimbursements broadly (Start date -> Future)
+# We only care that the reimbursement happened AFTER the target month started
+mask_reim = (df_reim['approval-date'] >= TARGET_MONTH_START)
+df_reim = df_reim.loc[mask_reim].copy()
+
+print(f"Auditing Inventory from {TARGET_MONTH_START} to {TARGET_MONTH_END}")
+print(f"Checking for Reimbursements from {TARGET_MONTH_START} to {df_reim['approval-date'].max().date()}")
+
+# --- STEP 3: CALCULATE NET LOSS (INVENTORY) ---
+for col in ['lost', 'damaged', 'found']:
+    df_inv[col] = df_inv[col].fillna(0) if col in df_inv.columns else 0
+
+inv_summary = df_inv.groupby('fnsku')[['lost', 'damaged', 'found']].sum().reset_index()
+inv_summary['net_loss_units'] = (inv_summary['lost'] + inv_summary['damaged']) - inv_summary['found']
+inv_summary = inv_summary[inv_summary['net_loss_units'] > 0]
+
+# --- STEP 4: CALCULATE PAYMENTS (REIMBURSEMENTS) ---
+reim_qty_col = 'quantity-reimbursed-total'
+reim_amt_col = 'amount-total'
+df_reim[reim_qty_col] = df_reim[reim_qty_col].fillna(0)
+df_reim[reim_amt_col] = df_reim[reim_amt_col].fillna(0)
+
+reim_summary = df_reim.groupby('fnsku')[[reim_qty_col, reim_amt_col]].sum().reset_index()
+
+# Calculate average value per unit
+reim_summary['avg_val_per_unit'] = reim_summary.apply(
+    lambda x: x[reim_amt_col] / x[reim_qty_col] if x[reim_qty_col] > 0 else 0, axis=1
+)
+reim_summary.rename(columns={reim_qty_col: 'total_reimbursed_qty'}, inplace=True)
+
+# --- STEP 5: COMPARE ---
+final_report = pd.merge(inv_summary, reim_summary, on='fnsku', how='left')
+final_report['total_reimbursed_qty'] = final_report['total_reimbursed_qty'].fillna(0)
+final_report['avg_val_per_unit'] = final_report['avg_val_per_unit'].fillna(0)
+
+# DISCREPANCY CALCULATION
+final_report['units_owed'] = final_report['net_loss_units'] - final_report['total_reimbursed_qty']
+final_report['est_money_owed'] = final_report['units_owed'] * final_report['avg_val_per_unit']
+
+# Sort and Export
+actionable_report = final_report[final_report['units_owed'] > 0].sort_values(by='units_owed', ascending=False)
+
+print(f"\nFound {len(actionable_report)} FNSKUs with discrepancies.")
+if not actionable_report.empty:
+    print(actionable_report[['fnsku', 'net_loss_units', 'total_reimbursed_qty', 'units_owed', 'est_money_owed']].head())
+    actionable_report.to_csv('december_reconciliation_results.csv', index=False)
