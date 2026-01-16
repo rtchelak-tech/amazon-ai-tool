@@ -380,8 +380,53 @@ with tab2:
     cA, cB, cC = st.columns([1, 1, 1])
     ledger_upload = cA.file_uploader("1) Upload 'Inventory Ledger' (Daily) CSV", type=["csv"], key="ledger_upload")
     reimb_upload = cB.file_uploader("2) Upload 'Reimbursements' CSV", type=["csv"], key="reimb_upload")
-    min_age_days = cC.number_input("Delay window (days)", min_value=0, max_value=180, value=45, step=5,
-                                  help="Amazon often reimburses with a delay. We avoid flagging recent losses.")
+    min_age_days = cC.number_input(
+        "Delay window (days)",
+        min_value=0, max_value=180, value=45, step=5,
+        help="Amazon often reimburses with a delay. We avoid flagging recent losses."
+    )
+
+    # --- Local override: FIXED reimbursement normalizer (prevents ValueError) ---
+    def normalize_reimbursements_fixed(df_reim: pd.DataFrame) -> pd.DataFrame:
+        df = clean_columns(df_reim)
+
+        required = ["approval-date", "reason"]
+        if not require_columns(df, required, "Reimbursements Report"):
+            return pd.DataFrame()
+
+        # Ensure common columns exist (Amazon exports vary)
+        for col in [
+            "fnsku", "sku", "asin", "product-name", "reimbursement-id", "case-id",
+            "amazon-order-id", "condition", "currency-unit", "amount-total", "amount-per-unit"
+        ]:
+            if col not in df.columns:
+                df[col] = ""
+
+        df["approval-date"] = pd.to_datetime(df["approval-date"], errors="coerce")
+
+        # Map reason -> event_type for our audit (lost/damage/dispose)
+        df["reason_norm"] = df["reason"].astype(str).str.strip().str.lower()
+        df["event_type"] = df["reason_norm"].map(REASON_MAP)
+
+        # Quantity reimbursed: sum any columns that start with "quantity-reimbursed"
+        qty_cols = [c for c in df.columns if c.startswith("quantity-reimbursed")]
+
+        if qty_cols:
+            # Convert each qty column to numeric safely, then sum across columns per row
+            qty_df = df[qty_cols].apply(lambda col: to_number(col))
+            df["qty_reimbursed"] = qty_df.sum(axis=1)
+        else:
+            df["qty_reimbursed"] = 0
+
+        # Amount fields
+        df["amount_total"] = to_number(df["amount-total"]) if "amount-total" in df.columns else 0
+        df["amount_per_unit"] = to_number(df["amount-per-unit"]) if "amount-per-unit" in df.columns else 0
+
+        # Keep only reimbursable warehouse loss types (this tab)
+        audited = df[df["event_type"].isin(["lost", "damage", "dispose"])].copy()
+        audited = audited[audited["qty_reimbursed"] != 0]
+
+        return audited
 
     if ledger_upload and reimb_upload:
         with st.spinner("Loading and auditing..."):
@@ -389,7 +434,9 @@ with tab2:
             df_reim_raw = load_csv(reimb_upload)
 
             df_ledger = normalize_ledger_daily(df_ledger_raw)
-            df_reim = normalize_reimbursements(df_reim_raw)
+
+            # Use the FIXED normalizer here
+            df_reim = normalize_reimbursements_fixed(df_reim_raw)
 
             ledger_losses = extract_ledger_losses(df_ledger)
 
@@ -399,7 +446,9 @@ with tab2:
                 min_age_days=int(min_age_days)
             )
 
-        if df_ledger.empty or ledger_losses.empty:
+        if df_ledger.empty:
+            st.error("Ledger failed validation — check that you uploaded the Daily Inventory Ledger export.")
+        elif ledger_losses.empty:
             st.warning("Ledger loaded but no loss-related rows were found (lost/damage/dispose/unknown).")
         else:
             st.success("✅ Audit complete.")
@@ -411,24 +460,34 @@ with tab2:
             k3.metric("Units Likely Owed", f"{summary.loc[0,'owed_units_old_enough']:.0f}")
             k4.metric("Est. $ Owed (conservative)", f"${summary.loc[0,'est_amount_owed']:,.2f}")
 
-            st.caption(f"Using delay window: {int(min_age_days)} days. "
-                       "Est. $ uses average reimbursed $/unit when available; otherwise stays $0 to avoid misleading numbers.")
+            st.caption(
+                f"Using delay window: {int(min_age_days)} days. "
+                "Est. $ uses average reimbursed $/unit when available; otherwise stays $0 to avoid misleading numbers."
+            )
 
             st.divider()
 
             # Charts
             st.subheader("Losses by Type (Ledger)")
-            loss_by_type = ledger_losses.groupby("event_type", as_index=False)["qty_lost"].sum().sort_values("qty_lost", ascending=False)
+            loss_by_type = (
+                ledger_losses.groupby("event_type", as_index=False)["qty_lost"]
+                .sum()
+                .sort_values("qty_lost", ascending=False)
+            )
             fig1 = px.bar(loss_by_type, x="event_type", y="qty_lost", title="Ledger Loss Units by Event Type")
             st.plotly_chart(fig1, use_container_width=True)
 
             if not owed.empty:
                 st.subheader("🚨 Likely Owed by Amazon (Old Enough)")
-                owed_view = owed.copy()
-                owed_view = owed_view.sort_values(["est_amount_owed", "qty_owed"], ascending=False)
+                owed_view = owed.copy().sort_values(["est_amount_owed", "qty_owed"], ascending=False)
 
-                show_cols = ["fnsku", "msku", while_exists := "asin", "event_type", "qty_lost", "qty_reimbursed", "qty_owed",
-                             "avg_reim_per_unit", "est_amount_owed", "oldest_loss_date", "newest_loss_date", "title"]
+                show_cols = [
+                    "fnsku", "msku", "asin", "event_type",
+                    "qty_lost", "qty_reimbursed", "qty_owed",
+                    "avg_reim_per_unit", "est_amount_owed",
+                    "oldest_loss_date", "newest_loss_date",
+                    "title"
+                ]
                 show_cols = [c for c in show_cols if c in owed_view.columns]
 
                 st.dataframe(owed_view[show_cols], use_container_width=True, height=420)
@@ -454,7 +513,6 @@ with tab2:
             else:
                 st.info("No owed cases found (after applying delay window + netting vs reimbursements).")
 
-            # Debug / preview section
             with st.expander("🔎 Debug: normalized previews"):
                 st.write("Ledger (normalized) preview")
                 st.dataframe(df_ledger.head(25), use_container_width=True)
