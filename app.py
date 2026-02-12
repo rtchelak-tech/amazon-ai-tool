@@ -57,27 +57,9 @@ def load_csv(uploaded_file) -> pd.DataFrame:
     try:
         df = pd.read_csv(uploaded_file)
     except UnicodeDecodeError:
+        uploaded_file.seek(0)
         df = pd.read_csv(uploaded_file, encoding="latin-1")
     return df
-
-def detect_report_type(df: pd.DataFrame) -> str:
-    cols = set(df.columns)
-    # Reimbursements report heuristics
-    if "reimbursement-id" in cols and "approval-date" in cols and "reason" in cols:
-        return "reimbursements"
-    # Inventory Ledger (Daily) heuristics
-    if "fnsku" in cols and "starting warehouse balance" in cols and "ending warehouse balance" in cols:
-        return "ledger_daily"
-    # Inventory Health heuristics
-    if "estimated-excess-quantity" in cols and "estimated-storage-cost-next-month" in cols:
-        return "inventory_health"
-    # Customer Returns heuristics (common)
-    if "return-reason" in cols or "customer-comments" in cols:
-        return "customer_returns"
-    # Settlement
-    if "settlement-id" in cols or "amount-type" in cols:
-        return "settlement"
-    return "unknown"
 
 # =========================
 # Tab 2: Lost Money Engine
@@ -147,52 +129,6 @@ def extract_ledger_losses(df_ledger_norm: pd.DataFrame) -> pd.DataFrame:
     losses["qty_lost"] = to_number(losses["qty_lost"])
     return losses
 
-def normalize_reimbursements(df_reim: pd.DataFrame) -> pd.DataFrame:
-    df = clean_columns(df_reim)
-
-    required = ["approval-date", "reason"]
-    if not require_columns(df, required, "Reimbursements Report"):
-        return pd.DataFrame()
-
-    # Key columns often present
-    for col in ["fnsku", "sku", "asin", "product-name", "reimbursement-id", "case-id", "amazon-order-id", "condition", "currency-unit"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    df["approval-date"] = pd.to_datetime(df["approval-date"], errors="coerce")
-
-    # Map reason -> event_type (we only use warehouse/inbound loss types in this tab)
-    df["reason_norm"] = df["reason"].astype(str).str.strip().str.lower()
-    df["event_type"] = df["reason_norm"].map(REASON_MAP)
-
-    # Quantity columns vary; sum anything that starts with quantity-reimbursed
-    qty_cols = [c for c in df.columns if c.startswith("quantity-reimbursed")]
-    if qty_cols:
-        df["qty_reimbursed"] = df[qty_cols].apply(to_number)
-        df["qty_reimbursed"] = df[qty_cols].apply(lambda row: row.sum(), axis=1)
-    else:
-        # Fallback if Amazon changes it (rare)
-        df["qty_reimbursed"] = 0
-
-    # Amount columns
-    if "amount-total" in df.columns:
-        df["amount_total"] = to_number(df["amount-total"])
-    else:
-        df["amount_total"] = 0
-
-    if "amount-per-unit" in df.columns:
-        df["amount_per_unit"] = to_number(df["amount-per-unit"])
-    else:
-        df["amount_per_unit"] = 0
-
-    # Filter to only event_types we audit (lost/damage/dispose/unknown if present)
-    audited = df[df["event_type"].isin(["lost", "damage", "dispose"])].copy()
-
-    # Keep only meaningful rows
-    audited = audited[audited["qty_reimbursed"] != 0]
-
-    return audited
-
 def build_lost_money_audit(ledger_losses: pd.DataFrame, reim_norm: pd.DataFrame, min_age_days: int = 45):
     """
     Returns:
@@ -239,10 +175,14 @@ def build_lost_money_audit(ledger_losses: pd.DataFrame, reim_norm: pd.DataFrame,
     if not reim_norm.empty:
         per_unit = (reim_norm[reim_norm["qty_reimbursed"] > 0]
                     .groupby(["fnsku", "event_type"], as_index=False)
-                    .apply(lambda g: pd.Series({
-                        "avg_reim_per_unit": (g["amount_total"].sum() / g["qty_reimbursed"].sum()) if g["qty_reimbursed"].sum() else 0
-                    }))
-                    .reset_index(drop=True))
+                    .agg(
+                        _total_amount=("amount_total", "sum"),
+                        _total_qty=("qty_reimbursed", "sum"),
+                    ))
+        per_unit["avg_reim_per_unit"] = per_unit.apply(
+            lambda r: r["_total_amount"] / r["_total_qty"] if r["_total_qty"] else 0, axis=1
+        )
+        per_unit = per_unit.drop(columns=["_total_amount", "_total_qty"])
         owed = owed.merge(per_unit, on=["fnsku", "event_type"], how="left")
         owed["avg_reim_per_unit"] = owed["avg_reim_per_unit"].fillna(0)
         owed["est_amount_owed"] = owed["qty_owed"] * owed["avg_reim_per_unit"]
