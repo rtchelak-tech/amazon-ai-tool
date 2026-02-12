@@ -248,16 +248,20 @@ with st.sidebar:
 **7. Removal Orders**
 *File:* `Removal Order Detail`
 *Goal:* Track removals, disposals, stuck orders.
+
+**8. Restocking**
+*File:* `FBA Inventory Health`
+*Goal:* Reorder points, stockout dates, velocity trends.
 """)
     st.divider()
-    st.caption("v3.0 - Full Analytics Suite")
+    st.caption("v3.1 - Restocking Intelligence")
 
 # =========================
 # Main UI Tabs
 # =========================
 st.title("🚀 Amazon FBA Command Center (US)")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📦 Inventory Health",
     "💸 Lost Money & Reimbursements",
     "↩️ Returns Analysis",
@@ -265,6 +269,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "💰 Net Profit",
     "🔍 Business & Traffic",
     "🚚 Removal Orders",
+    "🔄 Restocking",
 ])
 
 # ==========================================
@@ -1028,3 +1033,282 @@ with tab7:
 
     else:
         st.info("Upload your **Removal Order Detail** report to track removal costs, disposition, and identify stuck orders.")
+
+# ==========================================
+# TAB 8: RESTOCKING INTELLIGENCE
+# ==========================================
+with tab8:
+    st.header("Restocking Intelligence")
+    st.markdown("""
+Upload your **FBA Inventory Health** report (same file as Tab 1).
+Uses 30-day and 60-day sales velocity to calculate reorder points, days of supply, and stockout dates.
+""")
+
+    # --- Seller-configurable parameters ---
+    st.subheader("Settings")
+    cfg1, cfg2, cfg3 = st.columns(3)
+    with cfg1:
+        lead_time = st.number_input("Lead Time (days)", min_value=1, max_value=180, value=30,
+                                     help="Days from placing a PO to units being available at FBA (include manufacturing + shipping + check-in).")
+    with cfg2:
+        safety_days = st.number_input("Safety Stock (days)", min_value=0, max_value=90, value=14,
+                                       help="Extra buffer days to absorb demand spikes and shipping delays.")
+    with cfg3:
+        target_dos = st.number_input("Target Days of Supply", min_value=14, max_value=365, value=60,
+                                      help="How many days of inventory you want on hand after restock arrives.")
+
+    st.divider()
+
+    restock_file = st.file_uploader("Upload 'FBA Inventory Health' CSV", type=["csv"], key="restock_upload")
+
+    if restock_file:
+        df = clean_columns(load_csv(restock_file))
+
+        # --- Map columns (Inventory Health report) ---
+        numeric_fields = [
+            "available", "afn-fulfillable-quantity",
+            "units-shipped-last-24-hrs",
+            "units-shipped-last-7-days",
+            "units-shipped-last-30-days",
+            "units-shipped-last-60-days",
+            "units-shipped-last-90-days",
+            "your-price",
+            "afn-inbound-working-quantity",
+            "afn-inbound-shipped-quantity",
+            "afn-inbound-receiving-quantity",
+            "afn-reserved-quantity",
+            "inv-age-0-to-90-days",
+            "inv-age-91-to-180-days",
+            "inv-age-181-to-270-days",
+            "inv-age-271-to-365-days",
+            "inv-age-365-plus-days",
+        ]
+        for col in numeric_fields:
+            if col in df.columns:
+                df[col] = to_number(df[col])
+            else:
+                df[col] = 0
+
+        # Current fulfillable stock — try 'available' first (common), then 'afn-fulfillable-quantity'
+        if df["available"].sum() > 0:
+            df["current_stock"] = df["available"]
+        else:
+            df["current_stock"] = df["afn-fulfillable-quantity"]
+
+        # Inbound pipeline (units not yet checked in)
+        df["inbound_total"] = (
+            df["afn-inbound-working-quantity"]
+            + df["afn-inbound-shipped-quantity"]
+            + df["afn-inbound-receiving-quantity"]
+        )
+
+        # Total available = on-hand + inbound
+        df["total_available"] = df["current_stock"] + df["inbound_total"]
+
+        # --- Velocity calculations ---
+        df["velocity_30d"] = df["units-shipped-last-30-days"] / 30
+        df["velocity_60d"] = df["units-shipped-last-60-days"] / 60
+
+        # Trend indicator: compare 30-day avg vs 60-day avg
+        # If 30d velocity > 60d velocity by 15%+ → accelerating
+        # If 30d velocity < 60d velocity by 15%+ → decelerating
+        def velocity_trend(row):
+            v30, v60 = row["velocity_30d"], row["velocity_60d"]
+            if v60 == 0 and v30 == 0:
+                return "No Sales"
+            if v60 == 0:
+                return "New Momentum"
+            ratio = v30 / v60
+            if ratio >= 1.15:
+                return "Accelerating"
+            elif ratio <= 0.85:
+                return "Decelerating"
+            return "Stable"
+
+        df["trend"] = df.apply(velocity_trend, axis=1)
+
+        # --- Core restocking math (use 30-day velocity as primary) ---
+        df["days_of_supply"] = df.apply(
+            lambda r: r["total_available"] / r["velocity_30d"] if r["velocity_30d"] > 0 else 9999, axis=1
+        )
+        df["days_of_supply"] = df["days_of_supply"].clip(upper=9999)
+
+        df["reorder_point_units"] = (lead_time + safety_days) * df["velocity_30d"]
+        df["reorder_qty"] = (
+            (target_dos * df["velocity_30d"]) - df["total_available"]
+        ).clip(lower=0).round(0).astype(int)
+
+        df["stockout_date"] = df.apply(
+            lambda r: (datetime.now() + timedelta(days=int(r["days_of_supply"]))).strftime("%Y-%m-%d")
+            if r["velocity_30d"] > 0 and r["days_of_supply"] < 9999
+            else "N/A",
+            axis=1,
+        )
+
+        df["reorder_cost"] = df["reorder_qty"] * df["your-price"]
+
+        # --- Urgency status ---
+        def urgency(row):
+            dos = row["days_of_supply"]
+            if row["current_stock"] == 0 and row["velocity_30d"] > 0:
+                return "OUT OF STOCK"
+            if dos <= lead_time:
+                return "CRITICAL"
+            if dos <= lead_time + safety_days:
+                return "LOW"
+            if dos > target_dos * 2:
+                return "OVERSTOCK"
+            return "OK"
+
+        df["status"] = df.apply(urgency, axis=1)
+
+        # --- Filter to products with actual sales ---
+        active = df[df["units-shipped-last-60-days"] > 0].copy()
+
+        if active.empty:
+            st.warning("No products with sales in the last 60 days found. Check that your file has 'units-shipped-last-30-days' / 'units-shipped-last-60-days' columns.")
+        else:
+            # --- KPIs ---
+            oos_count = (active["status"] == "OUT OF STOCK").sum()
+            critical_count = (active["status"] == "CRITICAL").sum()
+            low_count = (active["status"] == "LOW").sum()
+            ok_count = (active["status"] == "OK").sum()
+            over_count = (active["status"] == "OVERSTOCK").sum()
+
+            total_reorder_units = active["reorder_qty"].sum()
+            total_reorder_cost = active["reorder_cost"].sum()
+
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("Out of Stock", int(oos_count))
+            k2.metric("Critical", int(critical_count))
+            k3.metric("Low Stock", int(low_count))
+            k4.metric("OK", int(ok_count))
+            k5.metric("Overstock", int(over_count))
+
+            k6, k7 = st.columns(2)
+            k6.metric("Total Reorder Units Needed", f"{int(total_reorder_units):,}")
+            k7.metric("Estimated Reorder Cost (at sell price)", f"${total_reorder_cost:,.2f}")
+
+            st.divider()
+
+            # --- Urgency distribution chart ---
+            st.subheader("Inventory Status Distribution")
+            status_counts = active["status"].value_counts().reset_index()
+            status_counts.columns = ["Status", "SKUs"]
+            color_map = {
+                "OUT OF STOCK": "#d32f2f",
+                "CRITICAL": "#f57c00",
+                "LOW": "#fbc02d",
+                "OK": "#388e3c",
+                "OVERSTOCK": "#1565c0",
+            }
+            fig_status = px.bar(
+                status_counts, x="Status", y="SKUs", color="Status",
+                color_discrete_map=color_map,
+                title="SKU Count by Restocking Urgency",
+            )
+            st.plotly_chart(fig_status, use_container_width=True)
+
+            # --- Days of supply distribution ---
+            reasonable = active[active["days_of_supply"] < 365].copy()
+            if not reasonable.empty:
+                st.subheader("Days of Supply Distribution")
+                fig_dos = px.histogram(
+                    reasonable, x="days_of_supply", nbins=30,
+                    title="Days of Supply Across Active SKUs",
+                    labels={"days_of_supply": "Days of Supply"},
+                )
+                fig_dos.add_vline(x=lead_time, line_dash="dash", line_color="red",
+                                  annotation_text=f"Lead Time ({lead_time}d)")
+                fig_dos.add_vline(x=lead_time + safety_days, line_dash="dash", line_color="orange",
+                                  annotation_text=f"Reorder Point ({lead_time + safety_days}d)")
+                st.plotly_chart(fig_dos, use_container_width=True)
+
+            # --- Velocity comparison: 30-day vs 60-day ---
+            st.subheader("Sales Velocity: 30-Day vs 60-Day")
+            st.caption("Products above the diagonal are accelerating (selling faster recently). Below = decelerating.")
+            top_velocity = active.nlargest(50, "velocity_30d")
+            name_col = "sku" if "sku" in top_velocity.columns else "asin"
+            fig_scatter = px.scatter(
+                top_velocity, x="velocity_60d", y="velocity_30d",
+                hover_name=name_col, color="trend",
+                color_discrete_map={
+                    "Accelerating": "#388e3c",
+                    "Decelerating": "#d32f2f",
+                    "Stable": "#757575",
+                    "New Momentum": "#1565c0",
+                    "No Sales": "#bdbdbd",
+                },
+                title="Daily Velocity (units/day): 30d vs 60d",
+                labels={"velocity_60d": "60-Day Avg (units/day)", "velocity_30d": "30-Day Avg (units/day)"},
+            )
+            # Add diagonal reference line
+            max_vel = max(top_velocity["velocity_30d"].max(), top_velocity["velocity_60d"].max(), 1)
+            fig_scatter.add_shape(type="line", x0=0, y0=0, x1=max_vel, y1=max_vel,
+                                  line=dict(color="gray", dash="dot"))
+            st.plotly_chart(fig_scatter, use_container_width=True)
+
+            # --- Priority reorder list ---
+            st.subheader("Reorder Priority List")
+            st.caption("Sorted by urgency, then days of supply (lowest first).")
+
+            status_order = {"OUT OF STOCK": 0, "CRITICAL": 1, "LOW": 2, "OK": 3, "OVERSTOCK": 4}
+            active["_status_rank"] = active["status"].map(status_order)
+            reorder_list = active.sort_values(["_status_rank", "days_of_supply"], ascending=[True, True])
+
+            display_cols = [
+                "sku", "asin", "product-name",
+                "status", "trend",
+                "current_stock", "inbound_total", "total_available",
+                "velocity_30d", "velocity_60d",
+                "days_of_supply", "stockout_date",
+                "reorder_qty", "reorder_cost", "your-price",
+            ]
+            display_cols = [c for c in display_cols if c in reorder_list.columns]
+
+            # Round numeric display columns
+            for rc in ["velocity_30d", "velocity_60d", "days_of_supply", "reorder_cost"]:
+                if rc in reorder_list.columns:
+                    reorder_list[rc] = reorder_list[rc].round(1)
+
+            # Status filter
+            filter_status = st.multiselect(
+                "Filter by status",
+                options=["OUT OF STOCK", "CRITICAL", "LOW", "OK", "OVERSTOCK"],
+                default=["OUT OF STOCK", "CRITICAL", "LOW"],
+            )
+            filtered = reorder_list[reorder_list["status"].isin(filter_status)] if filter_status else reorder_list
+
+            st.dataframe(filtered[display_cols], use_container_width=True)
+
+            st.download_button(
+                "⬇️ Download Full Reorder List (CSV)",
+                data=df_to_csv_download(reorder_list[display_cols]),
+                file_name="restock_priority_list.csv",
+                mime="text/csv",
+            )
+
+            # --- Overstock alert ---
+            overstock = active[active["status"] == "OVERSTOCK"].copy()
+            if not overstock.empty:
+                with st.expander(f"Overstock Alert ({len(overstock)} SKUs with > {target_dos * 2} days supply)"):
+                    st.caption("Consider running a sale, creating a removal order, or pausing reorders for these.")
+                    over_cols = ["sku", "asin", "product-name", "current_stock", "days_of_supply", "velocity_30d", "your-price"]
+                    over_cols = [c for c in over_cols if c in overstock.columns]
+                    st.dataframe(overstock[over_cols].sort_values("days_of_supply", ascending=False), use_container_width=True)
+
+    else:
+        st.info("""
+Upload your **FBA Inventory Health** report (same file used in the Inventory Health tab).
+
+**Report needed:** `FBA Inventory Health` from Seller Central > Reports > Fulfillment > Inventory
+
+This tab uses 30-day and 60-day sales velocity to calculate:
+- **Days of Supply** — how long current stock will last
+- **Reorder Point** — when to place your next order
+- **Reorder Quantity** — how many units to order
+- **Stockout Date** — when you'll run out
+- **Velocity Trend** — is demand accelerating or decelerating?
+
+Configure your lead time, safety stock, and target days of supply above.
+""")
