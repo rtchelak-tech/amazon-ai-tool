@@ -233,28 +233,38 @@ with st.sidebar:
 *File:* `FBA Customer Returns`
 *Goal:* Detect defect patterns.
 
-**4. True Inventory (Beta)**
-*Files:* `Inventory Ledger`, (optional later: Removals)
-*Goal:* Track ghost units.
+**4. Inventory Snapshot**
+*File:* `Manage FBA Inventory`
+*Goal:* See where every unit sits, find ghost units.
 
 **5. Net Profit**
 *File:* `Settlement Flat File V2`
-*Goal:* True pocket profit (later).
+*Goal:* True pocket profit after all fees.
+
+**6. Business & Traffic**
+*File:* `Detail Page Sales and Traffic`
+*Goal:* Conversion rates, Buy Box problems.
+
+**7. Removal Orders**
+*File:* `Removal Order Detail`
+*Goal:* Track removals, disposals, stuck orders.
 """)
     st.divider()
-    st.caption("v2.1 - Audit Engine Edition")
+    st.caption("v3.0 - Full Analytics Suite")
 
 # =========================
 # Main UI Tabs
 # =========================
 st.title("🚀 Amazon FBA Command Center (US)")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📦 Inventory Health",
     "💸 Lost Money & Reimbursements",
     "↩️ Returns Analysis",
-    "📉 True Inventory Tracker",
-    "💰 Net Profit"
+    "📊 Inventory Snapshot",
+    "💰 Net Profit",
+    "🔍 Business & Traffic",
+    "🚚 Removal Orders",
 ])
 
 # ==========================================
@@ -502,17 +512,519 @@ with tab3:
         st.info("Upload returns file to detect defects and trends.")
 
 # ==========================================
-# TAB 4: TRUE INVENTORY (placeholder)
+# TAB 4: INVENTORY SNAPSHOT (Manage FBA Inventory)
 # ==========================================
 with tab4:
-    st.header("True Inventory Lifecycle (Beta)")
-    st.markdown("Next step: reconcile inbound → sales → returns → removals → adjustments using ledger + other reports.")
-    st.info("This tab is intentionally left as Beta until we confirm which additional Amazon reports you’ll use (Removals, Manage FBA Inventory snapshot, etc.).")
+    st.header("Inventory Snapshot (Manage FBA Inventory)")
+    st.markdown("Upload your **Manage FBA Inventory** report to see where every unit sits right now.")
+
+    inv_snap_file = st.file_uploader("Upload 'Manage FBA Inventory' CSV/TXT", type=["csv", "txt"], key="inv_snap_upload")
+
+    if inv_snap_file:
+        df = clean_columns(load_csv(inv_snap_file))
+
+        qty_cols = [
+            "afn-fulfillable-quantity", "afn-unsellable-quantity",
+            "afn-reserved-quantity", "afn-total-quantity",
+            "afn-inbound-working-quantity", "afn-inbound-shipped-quantity",
+            "afn-inbound-receiving-quantity", "afn-researching-quantity",
+            "your-price",
+        ]
+        for col in qty_cols:
+            if col in df.columns:
+                df[col] = to_number(df[col])
+            else:
+                df[col] = 0
+
+        total_fulfillable = df["afn-fulfillable-quantity"].sum()
+        total_unsellable = df["afn-unsellable-quantity"].sum()
+        total_reserved = df["afn-reserved-quantity"].sum()
+        total_warehouse = df["afn-total-quantity"].sum()
+        total_researching = df["afn-researching-quantity"].sum()
+        inbound_pipeline = (
+            df["afn-inbound-working-quantity"].sum()
+            + df["afn-inbound-shipped-quantity"].sum()
+            + df["afn-inbound-receiving-quantity"].sum()
+        )
+
+        # KPIs
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Fulfillable Units", f"{int(total_fulfillable):,}")
+        k2.metric("Reserved Units", f"{int(total_reserved):,}")
+        k3.metric("Unsellable Units", f"{int(total_unsellable):,}", delta="Needs Removal", delta_color="inverse")
+        k4.metric("Inbound Pipeline", f"{int(inbound_pipeline):,}")
+
+        k5, k6 = st.columns(2)
+        k5.metric("Total Warehouse Units", f"{int(total_warehouse):,}")
+        if total_researching > 0:
+            k6.metric("Under Research (Ghost Units)", f"{int(total_researching):,}", delta="Potential Reimbursement", delta_color="inverse")
+        else:
+            k6.metric("Under Research", "0")
+
+        st.divider()
+
+        # Inventory breakdown chart
+        st.subheader("Inventory State Breakdown")
+        state_data = pd.DataFrame({
+            "State": ["Fulfillable", "Reserved", "Unsellable", "Researching"],
+            "Units": [total_fulfillable, total_reserved, total_unsellable, total_researching],
+        })
+        state_data = state_data[state_data["Units"] > 0]
+        if not state_data.empty:
+            fig_pie = px.pie(state_data, names="State", values="Units", title="Warehouse Inventory by State")
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        # Inbound pipeline breakdown
+        st.subheader("Inbound Pipeline")
+        inbound_data = pd.DataFrame({
+            "Stage": ["Working (Prep)", "Shipped (In Transit)", "Receiving (At FC)"],
+            "Units": [
+                df["afn-inbound-working-quantity"].sum(),
+                df["afn-inbound-shipped-quantity"].sum(),
+                df["afn-inbound-receiving-quantity"].sum(),
+            ],
+        })
+        fig_inbound = px.bar(inbound_data, x="Units", y="Stage", orientation="h", title="Inbound Shipment Pipeline")
+        st.plotly_chart(fig_inbound, use_container_width=True)
+
+        # Top SKUs by total inventory value
+        if "sku" in df.columns:
+            df["inv_value"] = df["afn-total-quantity"] * df["your-price"]
+            top_inv = df.sort_values("inv_value", ascending=False).head(15)
+            st.subheader("Top 15 SKUs by Estimated Inventory Value")
+            fig_top = px.bar(top_inv, x="inv_value", y="sku", orientation="h",
+                             title="Inventory Value ($)", color="inv_value")
+            st.plotly_chart(fig_top, use_container_width=True)
+
+        # Unsellable items needing removal
+        unsellable = df[df["afn-unsellable-quantity"] > 0].copy()
+        if not unsellable.empty:
+            st.subheader("Unsellable Inventory (Removal Candidates)")
+            show = ["sku", "fnsku", "asin", "product-name", "afn-unsellable-quantity", "your-price"]
+            show = [c for c in show if c in unsellable.columns]
+            unsellable = unsellable.sort_values("afn-unsellable-quantity", ascending=False)
+            st.dataframe(unsellable[show], use_container_width=True)
+            st.download_button(
+                "⬇️ Download Unsellable Items (CSV)",
+                data=df_to_csv_download(unsellable[show]),
+                file_name="unsellable_inventory.csv",
+                mime="text/csv",
+            )
+
+        # Ghost units under research
+        researching = df[df["afn-researching-quantity"] > 0].copy()
+        if not researching.empty:
+            st.subheader("Ghost Units (Under Research)")
+            st.caption("These units are under investigation by Amazon. If unresolved, they may qualify for reimbursement.")
+            show_r = ["sku", "fnsku", "asin", "product-name", "afn-researching-quantity"]
+            show_r = [c for c in show_r if c in researching.columns]
+            st.dataframe(researching[show_r], use_container_width=True)
+
+        with st.expander("Full Inventory Data"):
+            st.dataframe(df.head(100), use_container_width=True)
+
+    else:
+        st.info("Upload your **Manage FBA Inventory** report to see inventory breakdown by state, inbound pipeline, and ghost units.")
 
 # ==========================================
-# TAB 5: NET PROFIT (placeholder)
+# TAB 5: NET PROFIT (Settlement Flat File V2)
 # ==========================================
 with tab5:
-    st.header("Net Profit Calculator (Beta)")
-    st.markdown("Next step: parse Settlement Flat File V2, aggregate sales/refunds/fees, and optionally merge COGS.")
-    st.info("Upload support will be added after we confirm your exact Settlement file columns and whether you want true net (with COGS + ads) or Amazon-only margin.")
+    st.header("Net Profit Calculator (Settlement V2)")
+    st.markdown("Upload your **Settlement Flat File V2** to see exactly where every dollar went.")
+
+    settle_file = st.file_uploader("Upload 'Settlement Flat File V2' CSV/TXT", type=["csv", "txt"], key="settle_upload")
+
+    if settle_file:
+        df = clean_columns(load_csv(settle_file))
+
+        # Settlement V2 uses: amount-type, amount-description, amount
+        needed = ["amount-type", "amount-description", "amount"]
+        has_core = all(c in df.columns for c in needed)
+
+        if not has_core:
+            st.error(f"Missing required columns. Expected: {needed}. Found: {list(df.columns[:15])}")
+        else:
+            df["amount"] = to_number(df["amount"])
+
+            if "posted-date-time" in df.columns:
+                df["posted-date-time"] = pd.to_datetime(df["posted-date-time"], errors="coerce")
+            elif "posted-date" in df.columns:
+                df["posted-date-time"] = pd.to_datetime(df["posted-date"], errors="coerce")
+
+            if "transaction-type" not in df.columns:
+                df["transaction-type"] = ""
+            if "sku" not in df.columns:
+                df["sku"] = ""
+            if "quantity-purchased" not in df.columns:
+                df["quantity-purchased"] = 0
+            else:
+                df["quantity-purchased"] = to_number(df["quantity-purchased"])
+
+            # --- Aggregate by amount-type ---
+            by_type = df.groupby("amount-type", as_index=False)["amount"].sum().sort_values("amount")
+
+            product_sales = df[df["amount-description"].str.lower().str.strip() == "principal"]["amount"].sum()
+            total_fees = df[df["amount-type"].str.lower().str.strip() == "itemfees"]["amount"].sum()
+            total_promos = df[df["amount-type"].str.lower().str.strip() == "promotion"]["amount"].sum()
+            refund_rows = df[df["transaction-type"].str.lower().str.strip() == "refund"]
+            total_refunds = refund_rows["amount"].sum()
+            net_proceeds = df["amount"].sum()
+
+            # KPIs
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Product Sales (Principal)", f"${product_sales:,.2f}")
+            k2.metric("Amazon Fees", f"${total_fees:,.2f}", delta="Cost", delta_color="inverse")
+            k3.metric("Refunds", f"${total_refunds:,.2f}", delta="Cost", delta_color="inverse")
+            k4.metric("Net Proceeds", f"${net_proceeds:,.2f}",
+                       delta=f"{(net_proceeds / product_sales * 100):.1f}% margin" if product_sales else "N/A")
+
+            k5, k6 = st.columns(2)
+            k5.metric("Promotions / Discounts", f"${total_promos:,.2f}")
+            units_sold = df[
+                (df["transaction-type"].str.lower().str.strip() == "order")
+                & (df["amount-description"].str.lower().str.strip() == "principal")
+            ]["quantity-purchased"].sum()
+            k6.metric("Units Sold", f"{int(units_sold):,}")
+
+            st.divider()
+
+            # Fee breakdown chart
+            st.subheader("Where Does Your Money Go?")
+            by_desc = (
+                df.groupby("amount-description", as_index=False)["amount"]
+                .sum()
+                .sort_values("amount")
+            )
+            # Show top expense categories (negative amounts = costs)
+            expenses = by_desc[by_desc["amount"] < 0].copy()
+            expenses["amount_abs"] = expenses["amount"].abs()
+            expenses = expenses.sort_values("amount_abs", ascending=False).head(12)
+            if not expenses.empty:
+                fig_fees = px.bar(expenses, x="amount_abs", y="amount-description", orientation="h",
+                                  title="Top Fee Categories (Absolute $)", color="amount_abs")
+                st.plotly_chart(fig_fees, use_container_width=True)
+
+            # Amount-type breakdown (pie)
+            by_type_abs = by_type.copy()
+            by_type_abs["amount_abs"] = by_type_abs["amount"].abs()
+            by_type_abs = by_type_abs[by_type_abs["amount_abs"] > 0]
+            if not by_type_abs.empty:
+                fig_pie = px.pie(by_type_abs, names="amount-type", values="amount_abs",
+                                 title="Settlement Breakdown by Amount Type")
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+            # Daily revenue trend
+            if "posted-date-time" in df.columns and df["posted-date-time"].notna().any():
+                st.subheader("Daily Net Revenue Trend")
+                daily = (
+                    df.dropna(subset=["posted-date-time"])
+                    .assign(date=lambda x: x["posted-date-time"].dt.date)
+                    .groupby("date", as_index=False)["amount"]
+                    .sum()
+                    .sort_values("date")
+                )
+                if len(daily) > 1:
+                    fig_trend = px.line(daily, x="date", y="amount", title="Daily Net Amount")
+                    st.plotly_chart(fig_trend, use_container_width=True)
+
+            # Per-SKU profitability
+            if df["sku"].astype(str).str.strip().replace("", pd.NA).notna().any():
+                st.subheader("Per-SKU Profitability")
+                sku_profit = (
+                    df[df["sku"].astype(str).str.strip() != ""]
+                    .groupby("sku", as_index=False)
+                    .agg(
+                        revenue=("amount", lambda x: x[df.loc[x.index, "amount-description"].str.lower().str.strip() == "principal"].sum()),
+                        total_amount=("amount", "sum"),
+                        units=("quantity-purchased", "sum"),
+                    )
+                )
+                sku_profit["fees_and_other"] = sku_profit["total_amount"] - sku_profit["revenue"]
+                sku_profit["margin_%"] = (sku_profit["total_amount"] / sku_profit["revenue"] * 100).where(sku_profit["revenue"] != 0, 0).round(1)
+                sku_profit = sku_profit.sort_values("total_amount", ascending=False)
+                st.dataframe(sku_profit.head(50), use_container_width=True)
+
+                st.download_button(
+                    "⬇️ Download Per-SKU Profitability (CSV)",
+                    data=df_to_csv_download(sku_profit),
+                    file_name="sku_profitability.csv",
+                    mime="text/csv",
+                )
+
+            with st.expander("Raw Settlement Data Preview"):
+                st.dataframe(df.head(100), use_container_width=True)
+
+    else:
+        st.info("Upload your **Settlement Flat File V2** to see product sales, fees, refunds, and net proceeds broken down by SKU.")
+
+# ==========================================
+# TAB 6: BUSINESS & TRAFFIC ANALYTICS
+# ==========================================
+with tab6:
+    st.header("Business & Traffic Analytics")
+    st.markdown("Upload your **Detail Page Sales and Traffic by Child Item** report to find conversion and Buy Box problems.")
+
+    biz_file = st.file_uploader("Upload 'Business Report' CSV (Detail Page Sales & Traffic)", type=["csv"], key="biz_upload")
+
+    if biz_file:
+        df = clean_columns(load_csv(biz_file))
+
+        # Business report columns use mixed case with spaces; after clean_columns they're lowercase
+        # Map common variations to standardized names
+        col_map = {}
+        for c in df.columns:
+            if "child" in c and "asin" in c:
+                col_map[c] = "child_asin"
+            elif "parent" in c and "asin" in c:
+                col_map[c] = "parent_asin"
+            elif c == "sessions - total" or c == "sessions":
+                col_map[c] = "sessions"
+            elif c == "page views - total" or c == "page views":
+                col_map[c] = "page_views"
+            elif c == "buy box percentage" or c == "buy box percentage - b2b":
+                if "buy_box_pct" not in col_map.values():
+                    col_map[c] = "buy_box_pct"
+            elif c == "unit session percentage" or c == "unit session percentage - total":
+                col_map[c] = "conversion_rate"
+            elif c == "units ordered" or c == "units ordered - total":
+                if "units_ordered" not in col_map.values():
+                    col_map[c] = "units_ordered"
+            elif c == "ordered product sales" or c == "ordered product sales - total":
+                if "ordered_sales" not in col_map.values():
+                    col_map[c] = "ordered_sales"
+        df = df.rename(columns=col_map)
+
+        # Also handle SKU and title
+        if "title" not in df.columns:
+            df["title"] = ""
+        if "sku" not in df.columns:
+            df["sku"] = ""
+
+        for nc in ["sessions", "page_views", "units_ordered"]:
+            if nc in df.columns:
+                df[nc] = to_number(df[nc])
+            else:
+                df[nc] = 0
+
+        if "ordered_sales" in df.columns:
+            df["ordered_sales"] = to_number(df["ordered_sales"])
+        else:
+            df["ordered_sales"] = 0
+
+        # Percentages come as "12.34%" or "12.34" — normalize
+        for pct_col in ["buy_box_pct", "conversion_rate"]:
+            if pct_col in df.columns:
+                df[pct_col] = (
+                    df[pct_col].astype(str)
+                    .str.replace("%", "", regex=False)
+                    .str.replace(",", "", regex=False)
+                    .str.strip()
+                    .replace("", "0")
+                    .pipe(pd.to_numeric, errors="coerce")
+                    .fillna(0)
+                )
+            else:
+                df[pct_col] = 0
+
+        total_sessions = df["sessions"].sum()
+        total_units = df["units_ordered"].sum()
+        total_sales = df["ordered_sales"].sum()
+        avg_conversion = (total_units / total_sessions * 100) if total_sessions else 0
+        avg_buybox = df.loc[df["sessions"] > 0, "buy_box_pct"].mean() if (df["sessions"] > 0).any() else 0
+
+        # KPIs
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total Sessions", f"{int(total_sessions):,}")
+        k2.metric("Units Ordered", f"{int(total_units):,}")
+        k3.metric("Overall Conversion Rate", f"{avg_conversion:.2f}%")
+        k4.metric("Avg Buy Box %", f"{avg_buybox:.1f}%",
+                   delta="Low" if avg_buybox < 80 else "Good", delta_color="inverse" if avg_buybox < 80 else "normal")
+
+        st.metric("Ordered Product Sales", f"${total_sales:,.2f}")
+
+        st.divider()
+
+        # Top ASINs by sessions
+        asin_col = "child_asin" if "child_asin" in df.columns else "sku"
+        st.subheader("Top ASINs by Sessions")
+        top_sessions = df.sort_values("sessions", ascending=False).head(15)
+        fig_sess = px.bar(top_sessions, x="sessions", y=asin_col, orientation="h",
+                          title="Top 15 Products by Sessions", color="sessions")
+        st.plotly_chart(fig_sess, use_container_width=True)
+
+        # Conversion rate distribution
+        has_traffic = df[df["sessions"] >= 10].copy()
+        if not has_traffic.empty:
+            st.subheader("Conversion Rate Distribution (Products with 10+ Sessions)")
+            fig_conv = px.histogram(has_traffic, x="conversion_rate", nbins=20,
+                                    title="Conversion Rate Distribution (%)")
+            st.plotly_chart(fig_conv, use_container_width=True)
+
+        # Low-conversion high-traffic opportunities
+        st.subheader("Listing Optimization Opportunities")
+        st.caption("High traffic + low conversion = listing needs work (images, copy, price, reviews).")
+        if not has_traffic.empty:
+            opportunities = has_traffic.sort_values("conversion_rate", ascending=True).head(15)
+            show_opp = [asin_col, "title", "sessions", "units_ordered", "conversion_rate", "buy_box_pct", "ordered_sales"]
+            show_opp = [c for c in show_opp if c in opportunities.columns]
+            st.dataframe(opportunities[show_opp], use_container_width=True)
+
+        # Buy Box losers
+        bb_problems = df[(df["sessions"] >= 10) & (df["buy_box_pct"] < 80)].copy()
+        if not bb_problems.empty:
+            st.subheader("Buy Box Problems (< 80%)")
+            st.caption("Losing the Buy Box means losing sales even with traffic. Check pricing, seller metrics, or FBA enrollment.")
+            bb_problems = bb_problems.sort_values("buy_box_pct", ascending=True)
+            show_bb = [asin_col, "title", "sessions", "buy_box_pct", "units_ordered", "ordered_sales"]
+            show_bb = [c for c in show_bb if c in bb_problems.columns]
+            st.dataframe(bb_problems[show_bb].head(20), use_container_width=True)
+        else:
+            st.success("No Buy Box issues detected (all products with traffic are above 80%).")
+
+        # Revenue vs conversion scatter
+        if not has_traffic.empty and len(has_traffic) >= 3:
+            st.subheader("Sessions vs Conversion (Bubble = Revenue)")
+            fig_scatter = px.scatter(
+                has_traffic, x="sessions", y="conversion_rate",
+                size="ordered_sales", hover_name=asin_col,
+                title="Traffic vs Conversion (bubble size = revenue)",
+                labels={"sessions": "Sessions", "conversion_rate": "Conversion Rate (%)"},
+            )
+            st.plotly_chart(fig_scatter, use_container_width=True)
+
+        with st.expander("Full Business Report Data"):
+            st.dataframe(df.head(100), use_container_width=True)
+
+    else:
+        st.info("Upload your **Detail Page Sales and Traffic** report to analyze conversion rates, Buy Box ownership, and find listing optimization opportunities.")
+
+# ==========================================
+# TAB 7: REMOVAL ORDERS
+# ==========================================
+with tab7:
+    st.header("Removal Order Tracking")
+    st.markdown("Upload your **Removal Order Detail** report to track removals, disposals, and associated costs.")
+
+    removal_file = st.file_uploader("Upload 'Removal Order Detail' CSV/TXT", type=["csv", "txt"], key="removal_upload")
+
+    if removal_file:
+        df = clean_columns(load_csv(removal_file))
+
+        qty_fields = [
+            "requested-quantity", "cancelled-quantity", "disposed-quantity",
+            "shipped-quantity", "in-process-quantity",
+        ]
+        for col in qty_fields:
+            if col in df.columns:
+                df[col] = to_number(df[col])
+            else:
+                df[col] = 0
+
+        if "removal-fee" in df.columns:
+            df["removal-fee"] = to_number(df["removal-fee"])
+        else:
+            df["removal-fee"] = 0
+
+        if "request-date" in df.columns:
+            df["request-date"] = pd.to_datetime(df["request-date"], errors="coerce")
+        if "order-type" not in df.columns:
+            df["order-type"] = "Unknown"
+        if "order-status" not in df.columns:
+            df["order-status"] = ""
+        if "disposition" not in df.columns:
+            df["disposition"] = ""
+        if "sku" not in df.columns:
+            df["sku"] = ""
+
+        total_requested = df["requested-quantity"].sum()
+        total_shipped = df["shipped-quantity"].sum()
+        total_disposed = df["disposed-quantity"].sum()
+        total_cancelled = df["cancelled-quantity"].sum()
+        total_in_process = df["in-process-quantity"].sum()
+        total_fees = df["removal-fee"].sum()
+
+        # Remaining = requested but not yet accounted for
+        total_remaining = total_requested - (total_shipped + total_disposed + total_cancelled)
+
+        # KPIs
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Total Requested", f"{int(total_requested):,}")
+        k2.metric("Shipped Back", f"{int(total_shipped):,}")
+        k3.metric("Disposed", f"{int(total_disposed):,}")
+
+        k4, k5, k6 = st.columns(3)
+        k4.metric("Cancelled", f"{int(total_cancelled):,}", delta="Stock returned to FBA", delta_color="normal")
+        k5.metric("Still In Process", f"{int(total_in_process):,}")
+        k6.metric("Total Removal Fees", f"${total_fees:,.2f}", delta="Cost", delta_color="inverse")
+
+        if total_remaining > 0:
+            st.warning(f"**{int(total_remaining):,} units** requested but not yet shipped, disposed, or cancelled. These may be stuck.")
+
+        st.divider()
+
+        # Removal type breakdown
+        st.subheader("Removals by Order Type")
+        by_type = df.groupby("order-type", as_index=False)["requested-quantity"].sum().sort_values("requested-quantity", ascending=False)
+        if not by_type.empty:
+            fig_type = px.pie(by_type, names="order-type", values="requested-quantity", title="Removal Orders by Type")
+            st.plotly_chart(fig_type, use_container_width=True)
+
+        # Status breakdown
+        st.subheader("Order Status Breakdown")
+        by_status = df.groupby("order-status", as_index=False)["requested-quantity"].sum().sort_values("requested-quantity", ascending=False)
+        if not by_status.empty:
+            fig_status = px.bar(by_status, x="requested-quantity", y="order-status", orientation="h",
+                                title="Units by Order Status")
+            st.plotly_chart(fig_status, use_container_width=True)
+
+        # Disposition breakdown (Sellable vs Unsellable)
+        by_disp = df.groupby("disposition", as_index=False)["requested-quantity"].sum()
+        if not by_disp.empty and len(by_disp) > 1:
+            st.subheader("Disposition (Sellable vs Unsellable)")
+            fig_disp = px.pie(by_disp, names="disposition", values="requested-quantity", title="Removed Inventory Condition")
+            st.plotly_chart(fig_disp, use_container_width=True)
+
+        # Top SKUs by removal volume
+        if df["sku"].astype(str).str.strip().replace("", pd.NA).notna().any():
+            st.subheader("Top SKUs by Removal Volume")
+            sku_removals = (
+                df[df["sku"].astype(str).str.strip() != ""]
+                .groupby("sku", as_index=False)
+                .agg(
+                    requested=("requested-quantity", "sum"),
+                    shipped=("shipped-quantity", "sum"),
+                    disposed=("disposed-quantity", "sum"),
+                    cancelled=("cancelled-quantity", "sum"),
+                    fees=("removal-fee", "sum"),
+                )
+                .sort_values("requested", ascending=False)
+            )
+            st.dataframe(sku_removals.head(25), use_container_width=True)
+
+            st.download_button(
+                "⬇️ Download Removal Summary by SKU (CSV)",
+                data=df_to_csv_download(sku_removals),
+                file_name="removal_summary_by_sku.csv",
+                mime="text/csv",
+            )
+
+        # Removal trend over time
+        if "request-date" in df.columns and df["request-date"].notna().any():
+            st.subheader("Removal Trend Over Time")
+            monthly = (
+                df.dropna(subset=["request-date"])
+                .assign(month=lambda x: x["request-date"].dt.to_period("M").astype(str))
+                .groupby("month", as_index=False)["requested-quantity"]
+                .sum()
+                .sort_values("month")
+            )
+            if len(monthly) > 1:
+                fig_trend = px.bar(monthly, x="month", y="requested-quantity", title="Monthly Removal Requests")
+                st.plotly_chart(fig_trend, use_container_width=True)
+
+        with st.expander("Full Removal Order Data"):
+            st.dataframe(df.head(100), use_container_width=True)
+
+    else:
+        st.info("Upload your **Removal Order Detail** report to track removal costs, disposition, and identify stuck orders.")
