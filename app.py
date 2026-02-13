@@ -251,11 +251,11 @@ with st.sidebar:
 *Goal:* Track removals, disposals, stuck orders.
 
 **8. Restocking**
-*File:* `FBA Inventory Health`
-*Goal:* Reorder points, stockout dates, velocity trends.
+*Files:* `All Orders`, `Manage FBA Inventory`, `Reserve Inventory` (opt), `Inventory Ledger` (opt)
+*Goal:* Reorder points, stockout dates, velocity trends from real order data.
 """)
     st.divider()
-    st.caption("v3.1 - Restocking Intelligence")
+    st.caption("v4.0 - Multi-Report Restocking")
 
 # =========================
 # Main UI Tabs
@@ -1036,13 +1036,16 @@ with tab7:
         st.info("Upload your **Removal Order Detail** report to track removal costs, disposition, and identify stuck orders.")
 
 # ==========================================
-# TAB 8: RESTOCKING INTELLIGENCE
+# TAB 8: RESTOCKING INTELLIGENCE (Multi-Report)
 # ==========================================
 with tab8:
     st.header("Restocking Intelligence")
     st.markdown("""
-Uses your **FBA Inventory Health** report (same file as Tab 1) to calculate reorder points, days of supply, and stockout dates.
-*Amazon provides 30 & 90-day windows — we estimate the 31-90 day period from those.*
+Combines **4 reports** for accurate restocking decisions:
+- **All Orders** — real order-by-order velocity (7d / 14d / 30d / 60d / 90d windows)
+- **Manage FBA Inventory** — current stock, inbound pipeline, price
+- **Reserve Inventory** *(optional)* — breakdown of reserved units (recoverable vs stuck)
+- **Inventory Ledger** *(optional)* — shrinkage rate to pad reorder quantities
 """)
 
     # --- Seller-configurable parameters ---
@@ -1060,124 +1063,270 @@ Uses your **FBA Inventory Health** report (same file as Tab 1) to calculate reor
 
     st.divider()
 
-    # Reuse the file from Tab 1 if already uploaded, otherwise allow separate upload
-    restock_file = st.session_state.get("inv_upload", None)
-    if restock_file:
-        st.success("Using FBA Inventory Health file from Tab 1.")
-    else:
-        restock_file = st.file_uploader("Upload 'FBA Inventory Health' CSV", type=["csv"], key="restock_upload")
+    # --- File uploads ---
+    st.subheader("Upload Reports")
+    up_col1, up_col2 = st.columns(2)
+    with up_col1:
+        orders_file = st.file_uploader("1) All Orders CSV (required)", type=["csv", "txt", "tsv"], key="restock_orders")
+        inv_file = st.file_uploader("2) Manage FBA Inventory CSV (required)", type=["csv", "txt", "tsv"], key="restock_inv")
+    with up_col2:
+        reserve_file = st.file_uploader("3) Reserve Inventory CSV (optional)", type=["csv", "txt", "tsv"], key="restock_reserve")
+        ledger_file = st.file_uploader("4) Inventory Ledger CSV (optional)", type=["csv", "txt", "tsv"], key="restock_ledger")
 
-    if restock_file:
-        restock_file.seek(0)
-        df = clean_columns(load_csv(restock_file))
+    if orders_file and inv_file:
+        # ============================
+        # STEP 1: Parse All Orders → velocity per SKU
+        # ============================
+        orders_file.seek(0)
+        df_orders = clean_columns(load_csv(orders_file))
 
-        # --- Map columns (Inventory Health report) ---
-        # Amazon provides: 24hrs, 7d, 30d, 90d — NO 60-day column
-        numeric_fields = [
-            "available", "afn-fulfillable-quantity",
-            "units-shipped-last-24-hrs",
-            "units-shipped-last-7-days",
-            "units-shipped-last-30-days",
-            "units-shipped-last-90-days",
+        # Detect SKU column — Amazon uses "sku" or "seller-sku" depending on report version
+        sku_col_orders = None
+        for candidate in ["sku", "seller-sku"]:
+            if candidate in df_orders.columns:
+                sku_col_orders = candidate
+                break
+        if sku_col_orders is None:
+            st.error("All Orders file missing SKU column. Expected 'sku' or 'seller-sku'.")
+            st.write("Columns found:", list(df_orders.columns))
+            st.stop()
+
+        # Detect date column
+        date_col = None
+        for candidate in ["purchase-date", "order-date", "last-updated-date"]:
+            if candidate in df_orders.columns:
+                date_col = candidate
+                break
+        if date_col is None:
+            st.error("All Orders file missing date column. Expected 'purchase-date' or 'order-date'.")
+            st.write("Columns found:", list(df_orders.columns))
+            st.stop()
+
+        # Detect quantity column
+        qty_col = None
+        for candidate in ["quantity", "quantity-purchased", "item-quantity"]:
+            if candidate in df_orders.columns:
+                qty_col = candidate
+                break
+        if qty_col is None:
+            st.error("All Orders file missing quantity column. Expected 'quantity' or 'quantity-purchased'.")
+            st.write("Columns found:", list(df_orders.columns))
+            st.stop()
+
+        df_orders[date_col] = pd.to_datetime(df_orders[date_col], errors="coerce", utc=True)
+        df_orders[qty_col] = to_number(df_orders[qty_col])
+
+        # Filter to shipped / completed orders only (exclude cancelled/pending)
+        if "order-status" in df_orders.columns:
+            status_lower = df_orders["order-status"].astype(str).str.lower()
+            df_orders = df_orders[~status_lower.isin(["cancelled", "canceled", "pending"])].copy()
+
+        # Drop rows with no valid date
+        df_orders = df_orders.dropna(subset=[date_col])
+
+        today = pd.Timestamp.now(tz="UTC")
+        df_orders["_days_ago"] = (today - df_orders[date_col]).dt.days
+
+        # Compute velocity over multiple windows
+        velocity_windows = {"7d": 7, "14d": 14, "30d": 30, "60d": 60, "90d": 90}
+        vel_frames = []
+        for label, days in velocity_windows.items():
+            window_data = df_orders[df_orders["_days_ago"] <= days]
+            sku_sum = window_data.groupby(sku_col_orders)[qty_col].sum().reset_index()
+            sku_sum.columns = ["sku", f"units_{label}"]
+            sku_sum[f"velocity_{label}"] = sku_sum[f"units_{label}"] / days
+            vel_frames.append(sku_sum.set_index("sku"))
+
+        df_velocity = vel_frames[0]
+        for vf in vel_frames[1:]:
+            df_velocity = df_velocity.join(vf, how="outer")
+        df_velocity = df_velocity.fillna(0).reset_index()
+
+        # Trend: compare last 14d vs days 15-30
+        df_velocity["trend"] = "Stable"
+        v14 = df_velocity["velocity_14d"]
+        v30 = df_velocity["velocity_30d"]
+        # Days 15-30 velocity = (units_30d - units_14d) / 16
+        units_15_to_30 = (df_velocity["units_30d"] - df_velocity["units_14d"]).clip(lower=0)
+        v_older = units_15_to_30 / 16
+        no_sales = (v14 == 0) & (v_older == 0)
+        new_momentum = (v_older == 0) & (v14 > 0)
+        safe_ratio = v14 / v_older.replace(0, 1)
+        df_velocity.loc[no_sales, "trend"] = "No Sales"
+        df_velocity.loc[new_momentum, "trend"] = "New Momentum"
+        df_velocity.loc[~no_sales & ~new_momentum & (safe_ratio >= 1.15), "trend"] = "Accelerating"
+        df_velocity.loc[~no_sales & ~new_momentum & (safe_ratio <= 0.85), "trend"] = "Decelerating"
+
+        # Weekly velocity for sparkline chart (last 12 weeks)
+        df_orders["_week"] = df_orders[date_col].dt.to_period("W").apply(lambda r: r.start_time)
+        weekly_all = df_orders[df_orders["_days_ago"] <= 84].groupby([sku_col_orders, "_week"])[qty_col].sum().reset_index()
+        weekly_all.columns = ["sku", "week", "units"]
+
+        # ============================
+        # STEP 2: Parse Manage FBA Inventory → stock levels
+        # ============================
+        inv_file.seek(0)
+        df_inv = clean_columns(load_csv(inv_file))
+
+        # Detect SKU column in inventory file
+        sku_col_inv = None
+        for candidate in ["sku", "seller-sku", "msku"]:
+            if candidate in df_inv.columns:
+                sku_col_inv = candidate
+                break
+        if sku_col_inv is None:
+            st.error("Manage FBA Inventory file missing SKU column.")
+            st.write("Columns found:", list(df_inv.columns))
+            st.stop()
+
+        # Rename to standard "sku"
+        if sku_col_inv != "sku":
+            df_inv = df_inv.rename(columns={sku_col_inv: "sku"})
+
+        inv_numeric = [
+            "afn-fulfillable-quantity", "afn-inbound-working-quantity",
+            "afn-inbound-shipped-quantity", "afn-inbound-receiving-quantity",
+            "afn-reserved-quantity", "afn-unsellable-quantity",
             "your-price",
-            "afn-inbound-working-quantity",
-            "afn-inbound-shipped-quantity",
-            "afn-inbound-receiving-quantity",
-            "afn-reserved-quantity",
-            "inv-age-0-to-90-days",
-            "inv-age-91-to-180-days",
-            "inv-age-181-to-270-days",
-            "inv-age-271-to-365-days",
-            "inv-age-365-plus-days",
         ]
-
-        # Also handle 'sales-shipped-last-*' variant column names
-        sales_variant_map = {
-            "sales-shipped-last-24-hrs": "units-shipped-last-24-hrs",
-            "sales-shipped-last-7-days": "units-shipped-last-7-days",
-            "sales-shipped-last-30-days": "units-shipped-last-30-days",
-            "sales-shipped-last-90-days": "units-shipped-last-90-days",
-        }
-        for variant, canonical in sales_variant_map.items():
-            if variant in df.columns and canonical not in df.columns:
-                df[canonical] = df[variant]
-
-        for col in numeric_fields:
-            if col in df.columns:
-                df[col] = to_number(df[col])
+        for col in inv_numeric:
+            if col in df_inv.columns:
+                df_inv[col] = to_number(df_inv[col])
             else:
-                df[col] = 0
+                df_inv[col] = 0
 
-        # Show detected columns for debugging
-        velocity_cols_found = [c for c in df.columns if "shipped" in c or "sales-shipped" in c]
-        with st.expander("Detected velocity columns"):
-            st.write(velocity_cols_found if velocity_cols_found else "None found — check your report has units-shipped or sales-shipped columns")
+        df_inv["current_stock"] = df_inv["afn-fulfillable-quantity"]
+        df_inv["inbound_total"] = (
+            df_inv["afn-inbound-working-quantity"]
+            + df_inv["afn-inbound-shipped-quantity"]
+            + df_inv["afn-inbound-receiving-quantity"]
+        )
+        df_inv["reserved_qty"] = df_inv["afn-reserved-quantity"]
 
-        # Current fulfillable stock — try 'available' first (common), then 'afn-fulfillable-quantity'
-        if df["available"].sum() > 0:
-            df["current_stock"] = df["available"]
+        # Keep useful identity columns
+        id_cols = ["sku"]
+        for c in ["asin", "fnsku", "product-name"]:
+            if c in df_inv.columns:
+                id_cols.append(c)
+        inv_keep = id_cols + ["current_stock", "inbound_total", "reserved_qty",
+                              "afn-unsellable-quantity", "your-price"]
+        inv_keep = [c for c in inv_keep if c in df_inv.columns]
+        df_stock = df_inv[inv_keep].copy()
+
+        # ============================
+        # STEP 3 (optional): Reserve Inventory → recoverable reserved units
+        # ============================
+        reserve_recovery = 0.0  # fraction of reserved units likely to become available
+        if reserve_file:
+            reserve_file.seek(0)
+            df_reserve = clean_columns(load_csv(reserve_file))
+            res_sku = None
+            for candidate in ["sku", "seller-sku", "msku"]:
+                if candidate in df_reserve.columns:
+                    res_sku = candidate
+                    break
+            if res_sku:
+                if res_sku != "sku":
+                    df_reserve = df_reserve.rename(columns={res_sku: "sku"})
+                for rc in ["reserved-customerorders", "reserved-fc-transfers", "reserved-fc-processing"]:
+                    if rc in df_reserve.columns:
+                        df_reserve[rc] = to_number(df_reserve[rc])
+                    else:
+                        df_reserve[rc] = 0
+                # Customer orders = will ship soon (not recoverable)
+                # FC transfers = in transit between warehouses (will become available)
+                # FC processing = being processed (usually becomes available)
+                df_reserve["recoverable_reserved"] = (
+                    df_reserve["reserved-fc-transfers"] + df_reserve["reserved-fc-processing"]
+                )
+                df_reserve_agg = df_reserve.groupby("sku")[["recoverable_reserved"]].sum().reset_index()
+                df_stock = df_stock.merge(df_reserve_agg, on="sku", how="left")
+                df_stock["recoverable_reserved"] = df_stock["recoverable_reserved"].fillna(0)
+                st.success("Reserve Inventory loaded — recoverable units included in available stock.")
+            else:
+                df_stock["recoverable_reserved"] = 0
+                st.warning("Reserve Inventory file loaded but no SKU column found.")
         else:
-            df["current_stock"] = df["afn-fulfillable-quantity"]
+            df_stock["recoverable_reserved"] = 0
 
-        # Inbound pipeline (units not yet checked in)
-        df["inbound_total"] = (
-            df["afn-inbound-working-quantity"]
-            + df["afn-inbound-shipped-quantity"]
-            + df["afn-inbound-receiving-quantity"]
+        # ============================
+        # STEP 4 (optional): Inventory Ledger → shrinkage rate
+        # ============================
+        shrinkage_map = {}
+        if ledger_file:
+            ledger_file.seek(0)
+            df_ledger = clean_columns(load_csv(ledger_file))
+            led_sku = None
+            for candidate in ["msku", "sku", "seller-sku"]:
+                if candidate in df_ledger.columns:
+                    led_sku = candidate
+                    break
+            if led_sku:
+                # Sum up loss columns per SKU
+                loss_cols = ["lost", "damaged", "damage", "disposed", "dispose"]
+                receipt_cols = ["receipts", "received"]
+                for lc in loss_cols + receipt_cols:
+                    if lc in df_ledger.columns:
+                        df_ledger[lc] = to_number(df_ledger[lc])
+                    else:
+                        df_ledger[lc] = 0
+                df_ledger["_total_loss"] = sum(df_ledger[c].abs() for c in loss_cols if c in df_ledger.columns)
+                df_ledger["_total_received"] = sum(df_ledger[c].abs() for c in receipt_cols if c in df_ledger.columns)
+                ledger_agg = df_ledger.groupby(led_sku)[["_total_loss", "_total_received"]].sum().reset_index()
+                ledger_agg.columns = ["sku", "total_loss", "total_received"]
+                ledger_agg["shrinkage_rate"] = (
+                    ledger_agg["total_loss"] / ledger_agg["total_received"].replace(0, 1)
+                ).clip(upper=0.5)  # cap at 50% to avoid nonsense
+                shrinkage_map = dict(zip(ledger_agg["sku"], ledger_agg["shrinkage_rate"]))
+                avg_shrinkage = ledger_agg["shrinkage_rate"].mean()
+                st.success(f"Inventory Ledger loaded — avg shrinkage rate: {avg_shrinkage:.1%}")
+            else:
+                st.warning("Inventory Ledger loaded but no SKU column found (expected 'msku' or 'sku').")
+
+        # ============================
+        # STEP 5: Merge everything → restocking decisions
+        # ============================
+        df_merged = df_stock.merge(df_velocity, on="sku", how="inner")
+
+        if df_merged.empty:
+            st.warning("No matching SKUs between All Orders and Manage FBA Inventory. Check that SKU formats match between the two files.")
+            with st.expander("Debug: SKU samples"):
+                st.write("Orders SKUs (first 10):", list(df_velocity["sku"].head(10)))
+                st.write("Inventory SKUs (first 10):", list(df_stock["sku"].head(10)))
+            st.stop()
+
+        # Total available = on-hand + inbound + recoverable reserved
+        df_merged["total_available"] = (
+            df_merged["current_stock"]
+            + df_merged["inbound_total"]
+            + df_merged["recoverable_reserved"]
         )
 
-        # Total available = on-hand + inbound
-        df["total_available"] = df["current_stock"] + df["inbound_total"]
-
-        # --- Velocity calculations ---
-        # Amazon gives 30d and 90d. We derive:
-        #   velocity_30d = units last 30 days / 30
-        #   velocity_90d = units last 90 days / 90
-        #   velocity_60d_est = (units last 90 days - units last 30 days) / 60
-        #     (the "back half" — days 31-90 average — contrasts with recent 30d)
-        df["velocity_30d"] = df["units-shipped-last-30-days"] / 30
-        df["velocity_90d"] = df["units-shipped-last-90-days"] / 90
-        units_days_31_to_90 = (df["units-shipped-last-90-days"] - df["units-shipped-last-30-days"]).clip(lower=0)
-        df["velocity_60d_est"] = units_days_31_to_90 / 60
-
-        # Trend indicator: compare recent 30-day vs older 31-90 day period
-        # If 30d velocity > 31-90d velocity by 15%+ → accelerating
-        # If 30d velocity < 31-90d velocity by 15%+ → decelerating
-        def velocity_trend(row):
-            v30 = row["velocity_30d"]
-            v_older = row["velocity_60d_est"]
-            if v_older == 0 and v30 == 0:
-                return "No Sales"
-            if v_older == 0:
-                return "New Momentum"
-            ratio = v30 / v_older
-            if ratio >= 1.15:
-                return "Accelerating"
-            elif ratio <= 0.85:
-                return "Decelerating"
-            return "Stable"
-
-        df["trend"] = df.apply(velocity_trend, axis=1)
-
-        # --- Core restocking math (use 30-day velocity as primary) ---
-        df["days_of_supply"] = df.apply(
+        # Primary velocity = 30-day (most balanced window)
+        df_merged["days_of_supply"] = df_merged.apply(
             lambda r: r["total_available"] / r["velocity_30d"] if r["velocity_30d"] > 0 else 9999, axis=1
-        )
-        df["days_of_supply"] = df["days_of_supply"].clip(upper=9999)
+        ).clip(upper=9999)
 
-        df["reorder_point_units"] = (lead_time + safety_days) * df["velocity_30d"]
-        df["reorder_qty"] = (
-            (target_dos * df["velocity_30d"]) - df["total_available"]
-        ).clip(lower=0).round(0).astype(int)
+        df_merged["reorder_point_units"] = (lead_time + safety_days) * df_merged["velocity_30d"]
 
-        df["stockout_date"] = df.apply(
+        # Base reorder qty
+        df_merged["reorder_qty_base"] = (
+            (target_dos * df_merged["velocity_30d"]) - df_merged["total_available"]
+        ).clip(lower=0)
+
+        # Apply shrinkage padding if ledger was provided
+        df_merged["shrinkage_rate"] = df_merged["sku"].map(shrinkage_map).fillna(0)
+        df_merged["reorder_qty"] = (
+            df_merged["reorder_qty_base"] * (1 + df_merged["shrinkage_rate"])
+        ).round(0).astype(int)
+
+        df_merged["stockout_date"] = df_merged.apply(
             lambda r: (datetime.now() + timedelta(days=int(r["days_of_supply"]))).strftime("%Y-%m-%d")
-            if r["velocity_30d"] > 0 and r["days_of_supply"] < 9999
-            else "N/A",
+            if r["velocity_30d"] > 0 and r["days_of_supply"] < 9999 else "N/A",
             axis=1,
         )
 
-        df["reorder_cost"] = df["reorder_qty"] * df["your-price"]
+        df_merged["reorder_cost"] = df_merged["reorder_qty"] * df_merged["your-price"]
 
         # --- Urgency status ---
         def urgency(row):
@@ -1192,16 +1341,15 @@ Uses your **FBA Inventory Health** report (same file as Tab 1) to calculate reor
                 return "OVERSTOCK"
             return "OK"
 
-        df["status"] = df.apply(urgency, axis=1)
+        df_merged["status"] = df_merged.apply(urgency, axis=1)
 
-        # --- Filter to products with actual sales ---
-        has_30 = df["units-shipped-last-30-days"] > 0
-        has_90 = df["units-shipped-last-90-days"] > 0
-        active = df[has_30 | has_90].copy()
+        # Filter to products with actual sales
+        active = df_merged[df_merged["units_30d"] > 0].copy()
+        if active.empty:
+            active = df_merged[df_merged["units_90d"] > 0].copy()
 
         if active.empty:
-            st.warning("No products with sales found. Check that your report has 'units-shipped-last-30-days' or 'units-shipped-last-90-days' columns.")
-            st.write("Columns in your file:", list(df.columns))
+            st.warning("No products with sales found in the orders data.")
         else:
             # --- KPIs ---
             oos_count = (active["status"] == "OUT OF STOCK").sum()
@@ -1220,9 +1368,10 @@ Uses your **FBA Inventory Health** report (same file as Tab 1) to calculate reor
             k4.metric("OK", int(ok_count))
             k5.metric("Overstock", int(over_count))
 
-            k6, k7 = st.columns(2)
-            k6.metric("Total Reorder Units Needed", f"{int(total_reorder_units):,}")
-            k7.metric("Estimated Reorder Cost (at sell price)", f"${total_reorder_cost:,.2f}")
+            k6, k7, k8 = st.columns(3)
+            k6.metric("Total Reorder Units", f"{int(total_reorder_units):,}")
+            k7.metric("Est. Reorder Cost (sell price)", f"${total_reorder_cost:,.2f}")
+            k8.metric("Active SKUs Tracked", f"{len(active):,}")
 
             st.divider()
 
@@ -1259,14 +1408,34 @@ Uses your **FBA Inventory Health** report (same file as Tab 1) to calculate reor
                                   annotation_text=f"Reorder Point ({lead_time + safety_days}d)")
                 st.plotly_chart(fig_dos, use_container_width=True)
 
-            # --- Velocity comparison: Recent 30d vs Older 31-90d ---
-            st.subheader("Sales Velocity: Recent 30 Days vs Prior Period (Days 31-90)")
-            st.caption("Products above the diagonal are accelerating (selling faster recently). Below = decelerating.")
-            top_velocity = active.nlargest(50, "velocity_30d")
-            name_col = "sku" if "sku" in top_velocity.columns else "asin"
+            # --- Velocity across time windows ---
+            st.subheader("Velocity Comparison: 7d vs 14d vs 30d vs 60d vs 90d")
+            st.caption("Compare how velocity shifts across windows. A declining curve = slowing product. Rising = accelerating.")
+            top_vel = active.nlargest(20, "velocity_30d")
+            name_col = "sku"
+            vel_melt = top_vel.melt(
+                id_vars=[name_col],
+                value_vars=["velocity_7d", "velocity_14d", "velocity_30d", "velocity_60d", "velocity_90d"],
+                var_name="Window", value_name="Units/Day",
+            )
+            vel_melt["Window"] = vel_melt["Window"].str.replace("velocity_", "").str.upper()
+            fig_vel = px.line(
+                vel_melt, x="Window", y="Units/Day", color=name_col,
+                title="Top 20 SKUs: Daily Velocity by Time Window",
+                markers=True,
+            )
+            st.plotly_chart(fig_vel, use_container_width=True)
+
+            # --- Velocity scatter: Recent 14d vs Days 15-30 ---
+            st.subheader("Sales Trend: Last 14 Days vs Prior 2 Weeks")
+            st.caption("Above diagonal = accelerating. Below = decelerating.")
+            scatter_data = active.nlargest(50, "velocity_30d").copy()
+            scatter_data["velocity_15_30d"] = (
+                (scatter_data["units_30d"] - scatter_data["units_14d"]).clip(lower=0) / 16
+            )
             fig_scatter = px.scatter(
-                top_velocity, x="velocity_60d_est", y="velocity_30d",
-                hover_name=name_col, color="trend",
+                scatter_data, x="velocity_15_30d", y="velocity_14d",
+                hover_name="sku", color="trend",
                 color_discrete_map={
                     "Accelerating": "#388e3c",
                     "Decelerating": "#d32f2f",
@@ -1274,14 +1443,26 @@ Uses your **FBA Inventory Health** report (same file as Tab 1) to calculate reor
                     "New Momentum": "#1565c0",
                     "No Sales": "#bdbdbd",
                 },
-                title="Daily Velocity (units/day): Last 30d vs Days 31-90",
-                labels={"velocity_60d_est": "Days 31-90 Avg (units/day)", "velocity_30d": "Last 30-Day Avg (units/day)"},
+                title="Daily Velocity: Last 14d vs Days 15-30",
+                labels={"velocity_15_30d": "Days 15-30 Avg (units/day)", "velocity_14d": "Last 14-Day Avg (units/day)"},
             )
-            # Add diagonal reference line
-            max_vel = max(top_velocity["velocity_30d"].max(), top_velocity["velocity_60d_est"].max(), 1)
+            max_vel = max(scatter_data["velocity_14d"].max(), scatter_data["velocity_15_30d"].max(), 1)
             fig_scatter.add_shape(type="line", x0=0, y0=0, x1=max_vel, y1=max_vel,
                                   line=dict(color="gray", dash="dot"))
             st.plotly_chart(fig_scatter, use_container_width=True)
+
+            # --- Weekly sales trend (top 10 SKUs) ---
+            st.subheader("Weekly Sales Trend (Last 12 Weeks)")
+            top10_skus = active.nlargest(10, "velocity_30d")["sku"].tolist()
+            weekly_top = weekly_all[weekly_all["sku"].isin(top10_skus)]
+            if not weekly_top.empty:
+                fig_weekly = px.line(
+                    weekly_top, x="week", y="units", color="sku",
+                    title="Weekly Units Sold — Top 10 SKUs",
+                    labels={"week": "Week", "units": "Units Sold"},
+                    markers=True,
+                )
+                st.plotly_chart(fig_weekly, use_container_width=True)
 
             # --- Priority reorder list ---
             st.subheader("Reorder Priority List")
@@ -1294,17 +1475,21 @@ Uses your **FBA Inventory Health** report (same file as Tab 1) to calculate reor
             display_cols = [
                 "sku", "asin", "product-name",
                 "status", "trend",
-                "current_stock", "inbound_total", "total_available",
-                "velocity_30d", "velocity_90d",
+                "current_stock", "inbound_total", "recoverable_reserved", "total_available",
+                "velocity_7d", "velocity_14d", "velocity_30d", "velocity_90d",
                 "days_of_supply", "stockout_date",
                 "reorder_qty", "reorder_cost", "your-price",
             ]
+            if shrinkage_map:
+                display_cols.insert(-2, "shrinkage_rate")
             display_cols = [c for c in display_cols if c in reorder_list.columns]
 
             # Round numeric display columns
-            for rc in ["velocity_30d", "velocity_90d", "velocity_60d_est", "days_of_supply", "reorder_cost"]:
+            round_cols = ["velocity_7d", "velocity_14d", "velocity_30d", "velocity_60d",
+                          "velocity_90d", "days_of_supply", "reorder_cost", "shrinkage_rate"]
+            for rc in round_cols:
                 if rc in reorder_list.columns:
-                    reorder_list[rc] = reorder_list[rc].round(1)
+                    reorder_list[rc] = reorder_list[rc].round(2 if rc == "shrinkage_rate" else 1)
 
             # Status filter
             filter_status = st.multiselect(
@@ -1317,7 +1502,7 @@ Uses your **FBA Inventory Health** report (same file as Tab 1) to calculate reor
             st.dataframe(filtered[display_cols], use_container_width=True)
 
             st.download_button(
-                "⬇️ Download Full Reorder List (CSV)",
+                "Download Full Reorder List (CSV)",
                 data=df_to_csv_download(reorder_list[display_cols]),
                 file_name="restock_priority_list.csv",
                 mime="text/csv",
@@ -1328,22 +1513,39 @@ Uses your **FBA Inventory Health** report (same file as Tab 1) to calculate reor
             if not overstock.empty:
                 with st.expander(f"Overstock Alert ({len(overstock)} SKUs with > {target_dos * 2} days supply)"):
                     st.caption("Consider running a sale, creating a removal order, or pausing reorders for these.")
-                    over_cols = ["sku", "asin", "product-name", "current_stock", "days_of_supply", "velocity_30d", "your-price"]
+                    over_cols = ["sku", "asin", "product-name", "current_stock", "days_of_supply",
+                                 "velocity_30d", "your-price"]
                     over_cols = [c for c in over_cols if c in overstock.columns]
-                    st.dataframe(overstock[over_cols].sort_values("days_of_supply", ascending=False), use_container_width=True)
+                    st.dataframe(overstock[over_cols].sort_values("days_of_supply", ascending=False),
+                                 use_container_width=True)
+
+            # --- Data quality check ---
+            with st.expander("Data Quality & Debug"):
+                st.write(f"Orders file: {len(df_orders):,} rows, date range: "
+                         f"{df_orders[date_col].min().strftime('%Y-%m-%d')} to {df_orders[date_col].max().strftime('%Y-%m-%d')}")
+                st.write(f"Inventory file: {len(df_inv):,} SKUs")
+                st.write(f"Matched SKUs (orders + inventory): {len(df_merged):,}")
+                st.write(f"Active SKUs (with sales): {len(active):,}")
+                if shrinkage_map:
+                    st.write(f"Shrinkage rates applied: {len(shrinkage_map)} SKUs")
+                if reserve_file:
+                    st.write(f"Recoverable reserved units: {int(df_merged['recoverable_reserved'].sum()):,}")
 
     else:
         st.info("""
-Upload your **FBA Inventory Health** report (same file used in the Inventory Health tab).
+Upload your reports to get started:
 
-**Report needed:** `FBA Inventory Health` from Seller Central > Reports > Fulfillment > Inventory
+**Required:**
+1. **All Orders** — Seller Central > Reports > Fulfillment > All Orders
+   *(Provides real order-by-order sales data for accurate velocity)*
+2. **Manage FBA Inventory** — Seller Central > Reports > Fulfillment > Manage FBA Inventory
+   *(Current stock levels, inbound pipeline, prices)*
 
-Amazon provides 30-day and 90-day sales windows. This tab uses both to calculate:
-- **Days of Supply** — how long current stock will last
-- **Reorder Point** — when to place your next order
-- **Reorder Quantity** — how many units to order
-- **Stockout Date** — when you'll run out
-- **Velocity Trend** — compares last 30 days vs days 31-90 to detect acceleration
+**Optional (improves accuracy):**
+3. **Reserve Inventory** — Seller Central > Reports > Fulfillment > Reserve Inventory
+   *(Shows which reserved units will become available vs stuck)*
+4. **Inventory Ledger** — Seller Central > Reports > Fulfillment > Inventory Ledger
+   *(Detects shrinkage so reorder quantities are padded accordingly)*
 
-Configure your lead time, safety stock, and target days of supply above.
+Configure lead time, safety stock, and target days of supply above.
 """)
