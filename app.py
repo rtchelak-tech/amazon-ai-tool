@@ -26,6 +26,7 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
         .str.strip()
         .str.lower()
         .str.replace("\ufeff", "", regex=False)
+        .str.replace(" ", "-", regex=False)
     )
     return df
 
@@ -1040,8 +1041,8 @@ with tab7:
 with tab8:
     st.header("Restocking Intelligence")
     st.markdown("""
-Upload your **FBA Inventory Health** report (same file as Tab 1).
-Uses 30-day and 60-day sales velocity to calculate reorder points, days of supply, and stockout dates.
+Uses your **FBA Inventory Health** report (same file as Tab 1) to calculate reorder points, days of supply, and stockout dates.
+*Amazon provides 30 & 90-day windows — we estimate the 31-90 day period from those.*
 """)
 
     # --- Seller-configurable parameters ---
@@ -1059,18 +1060,24 @@ Uses 30-day and 60-day sales velocity to calculate reorder points, days of suppl
 
     st.divider()
 
-    restock_file = st.file_uploader("Upload 'FBA Inventory Health' CSV", type=["csv"], key="restock_upload")
+    # Reuse the file from Tab 1 if already uploaded, otherwise allow separate upload
+    restock_file = st.session_state.get("inv_upload", None)
+    if restock_file:
+        st.success("Using FBA Inventory Health file from Tab 1.")
+    else:
+        restock_file = st.file_uploader("Upload 'FBA Inventory Health' CSV", type=["csv"], key="restock_upload")
 
     if restock_file:
+        restock_file.seek(0)
         df = clean_columns(load_csv(restock_file))
 
         # --- Map columns (Inventory Health report) ---
+        # Amazon provides: 24hrs, 7d, 30d, 90d — NO 60-day column
         numeric_fields = [
             "available", "afn-fulfillable-quantity",
             "units-shipped-last-24-hrs",
             "units-shipped-last-7-days",
             "units-shipped-last-30-days",
-            "units-shipped-last-60-days",
             "units-shipped-last-90-days",
             "your-price",
             "afn-inbound-working-quantity",
@@ -1083,11 +1090,28 @@ Uses 30-day and 60-day sales velocity to calculate reorder points, days of suppl
             "inv-age-271-to-365-days",
             "inv-age-365-plus-days",
         ]
+
+        # Also handle 'sales-shipped-last-*' variant column names
+        sales_variant_map = {
+            "sales-shipped-last-24-hrs": "units-shipped-last-24-hrs",
+            "sales-shipped-last-7-days": "units-shipped-last-7-days",
+            "sales-shipped-last-30-days": "units-shipped-last-30-days",
+            "sales-shipped-last-90-days": "units-shipped-last-90-days",
+        }
+        for variant, canonical in sales_variant_map.items():
+            if variant in df.columns and canonical not in df.columns:
+                df[canonical] = df[variant]
+
         for col in numeric_fields:
             if col in df.columns:
                 df[col] = to_number(df[col])
             else:
                 df[col] = 0
+
+        # Show detected columns for debugging
+        velocity_cols_found = [c for c in df.columns if "shipped" in c or "sales-shipped" in c]
+        with st.expander("Detected velocity columns"):
+            st.write(velocity_cols_found if velocity_cols_found else "None found — check your report has units-shipped or sales-shipped columns")
 
         # Current fulfillable stock — try 'available' first (common), then 'afn-fulfillable-quantity'
         if df["available"].sum() > 0:
@@ -1106,19 +1130,27 @@ Uses 30-day and 60-day sales velocity to calculate reorder points, days of suppl
         df["total_available"] = df["current_stock"] + df["inbound_total"]
 
         # --- Velocity calculations ---
+        # Amazon gives 30d and 90d. We derive:
+        #   velocity_30d = units last 30 days / 30
+        #   velocity_90d = units last 90 days / 90
+        #   velocity_60d_est = (units last 90 days - units last 30 days) / 60
+        #     (the "back half" — days 31-90 average — contrasts with recent 30d)
         df["velocity_30d"] = df["units-shipped-last-30-days"] / 30
-        df["velocity_60d"] = df["units-shipped-last-60-days"] / 60
+        df["velocity_90d"] = df["units-shipped-last-90-days"] / 90
+        units_days_31_to_90 = (df["units-shipped-last-90-days"] - df["units-shipped-last-30-days"]).clip(lower=0)
+        df["velocity_60d_est"] = units_days_31_to_90 / 60
 
-        # Trend indicator: compare 30-day avg vs 60-day avg
-        # If 30d velocity > 60d velocity by 15%+ → accelerating
-        # If 30d velocity < 60d velocity by 15%+ → decelerating
+        # Trend indicator: compare recent 30-day vs older 31-90 day period
+        # If 30d velocity > 31-90d velocity by 15%+ → accelerating
+        # If 30d velocity < 31-90d velocity by 15%+ → decelerating
         def velocity_trend(row):
-            v30, v60 = row["velocity_30d"], row["velocity_60d"]
-            if v60 == 0 and v30 == 0:
+            v30 = row["velocity_30d"]
+            v_older = row["velocity_60d_est"]
+            if v_older == 0 and v30 == 0:
                 return "No Sales"
-            if v60 == 0:
+            if v_older == 0:
                 return "New Momentum"
-            ratio = v30 / v60
+            ratio = v30 / v_older
             if ratio >= 1.15:
                 return "Accelerating"
             elif ratio <= 0.85:
@@ -1163,10 +1195,13 @@ Uses 30-day and 60-day sales velocity to calculate reorder points, days of suppl
         df["status"] = df.apply(urgency, axis=1)
 
         # --- Filter to products with actual sales ---
-        active = df[df["units-shipped-last-60-days"] > 0].copy()
+        has_30 = df["units-shipped-last-30-days"] > 0
+        has_90 = df["units-shipped-last-90-days"] > 0
+        active = df[has_30 | has_90].copy()
 
         if active.empty:
-            st.warning("No products with sales in the last 60 days found. Check that your file has 'units-shipped-last-30-days' / 'units-shipped-last-60-days' columns.")
+            st.warning("No products with sales found. Check that your report has 'units-shipped-last-30-days' or 'units-shipped-last-90-days' columns.")
+            st.write("Columns in your file:", list(df.columns))
         else:
             # --- KPIs ---
             oos_count = (active["status"] == "OUT OF STOCK").sum()
@@ -1224,13 +1259,13 @@ Uses 30-day and 60-day sales velocity to calculate reorder points, days of suppl
                                   annotation_text=f"Reorder Point ({lead_time + safety_days}d)")
                 st.plotly_chart(fig_dos, use_container_width=True)
 
-            # --- Velocity comparison: 30-day vs 60-day ---
-            st.subheader("Sales Velocity: 30-Day vs 60-Day")
+            # --- Velocity comparison: Recent 30d vs Older 31-90d ---
+            st.subheader("Sales Velocity: Recent 30 Days vs Prior Period (Days 31-90)")
             st.caption("Products above the diagonal are accelerating (selling faster recently). Below = decelerating.")
             top_velocity = active.nlargest(50, "velocity_30d")
             name_col = "sku" if "sku" in top_velocity.columns else "asin"
             fig_scatter = px.scatter(
-                top_velocity, x="velocity_60d", y="velocity_30d",
+                top_velocity, x="velocity_60d_est", y="velocity_30d",
                 hover_name=name_col, color="trend",
                 color_discrete_map={
                     "Accelerating": "#388e3c",
@@ -1239,11 +1274,11 @@ Uses 30-day and 60-day sales velocity to calculate reorder points, days of suppl
                     "New Momentum": "#1565c0",
                     "No Sales": "#bdbdbd",
                 },
-                title="Daily Velocity (units/day): 30d vs 60d",
-                labels={"velocity_60d": "60-Day Avg (units/day)", "velocity_30d": "30-Day Avg (units/day)"},
+                title="Daily Velocity (units/day): Last 30d vs Days 31-90",
+                labels={"velocity_60d_est": "Days 31-90 Avg (units/day)", "velocity_30d": "Last 30-Day Avg (units/day)"},
             )
             # Add diagonal reference line
-            max_vel = max(top_velocity["velocity_30d"].max(), top_velocity["velocity_60d"].max(), 1)
+            max_vel = max(top_velocity["velocity_30d"].max(), top_velocity["velocity_60d_est"].max(), 1)
             fig_scatter.add_shape(type="line", x0=0, y0=0, x1=max_vel, y1=max_vel,
                                   line=dict(color="gray", dash="dot"))
             st.plotly_chart(fig_scatter, use_container_width=True)
@@ -1260,14 +1295,14 @@ Uses 30-day and 60-day sales velocity to calculate reorder points, days of suppl
                 "sku", "asin", "product-name",
                 "status", "trend",
                 "current_stock", "inbound_total", "total_available",
-                "velocity_30d", "velocity_60d",
+                "velocity_30d", "velocity_90d",
                 "days_of_supply", "stockout_date",
                 "reorder_qty", "reorder_cost", "your-price",
             ]
             display_cols = [c for c in display_cols if c in reorder_list.columns]
 
             # Round numeric display columns
-            for rc in ["velocity_30d", "velocity_60d", "days_of_supply", "reorder_cost"]:
+            for rc in ["velocity_30d", "velocity_90d", "velocity_60d_est", "days_of_supply", "reorder_cost"]:
                 if rc in reorder_list.columns:
                     reorder_list[rc] = reorder_list[rc].round(1)
 
@@ -1303,12 +1338,12 @@ Upload your **FBA Inventory Health** report (same file used in the Inventory Hea
 
 **Report needed:** `FBA Inventory Health` from Seller Central > Reports > Fulfillment > Inventory
 
-This tab uses 30-day and 60-day sales velocity to calculate:
+Amazon provides 30-day and 90-day sales windows. This tab uses both to calculate:
 - **Days of Supply** — how long current stock will last
 - **Reorder Point** — when to place your next order
 - **Reorder Quantity** — how many units to order
 - **Stockout Date** — when you'll run out
-- **Velocity Trend** — is demand accelerating or decelerating?
+- **Velocity Trend** — compares last 30 days vs days 31-90 to detect acceleration
 
 Configure your lead time, safety stock, and target days of supply above.
 """)
