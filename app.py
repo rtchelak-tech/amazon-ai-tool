@@ -26,6 +26,7 @@ def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
         .str.strip()
         .str.lower()
         .str.replace("\ufeff", "", regex=False)
+        .str.replace(" ", "-", regex=False)
     )
     return df
 
