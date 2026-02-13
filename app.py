@@ -1040,9 +1040,8 @@ with tab7:
 with tab8:
     st.header("Restocking Intelligence")
     st.markdown("""
-Upload your **FBA Inventory Health** report (same file as Tab 1).
-Uses 30-day and 90-day sales velocity to calculate reorder points, days of supply, and stockout dates.
-*Amazon provides 30 & 90-day windows — we estimate 60-day from those.*
+Uses your **FBA Inventory Health** report (same file as Tab 1) to calculate reorder points, days of supply, and stockout dates.
+*Amazon provides 30 & 90-day windows — we estimate the 31-90 day period from those.*
 """)
 
     # --- Seller-configurable parameters ---
@@ -1060,9 +1059,15 @@ Uses 30-day and 90-day sales velocity to calculate reorder points, days of suppl
 
     st.divider()
 
-    restock_file = st.file_uploader("Upload 'FBA Inventory Health' CSV", type=["csv"], key="restock_upload")
+    # Reuse the file from Tab 1 if already uploaded, otherwise allow separate upload
+    restock_file = st.session_state.get("inv_upload", None)
+    if restock_file:
+        st.success("Using FBA Inventory Health file from Tab 1.")
+    else:
+        restock_file = st.file_uploader("Upload 'FBA Inventory Health' CSV", type=["csv"], key="restock_upload")
 
     if restock_file:
+        restock_file.seek(0)
         df = clean_columns(load_csv(restock_file))
 
         # --- Map columns (Inventory Health report) ---
