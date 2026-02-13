@@ -1071,7 +1071,7 @@ Combines **4 reports** for accurate restocking decisions:
         safety_days = st.number_input("Safety Stock (days)", min_value=0, max_value=90, value=14,
                                        help="Extra buffer days to absorb demand spikes and shipping delays.")
     with cfg3:
-        target_dos = st.number_input("Target Days of Supply", min_value=14, max_value=365, value=60,
+        target_dos = st.number_input("Target Days of Supply", min_value=14, max_value=365, value=30,
                                       help="How many days of inventory you want on hand after restock arrives.")
 
     st.divider()
