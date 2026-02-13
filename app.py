@@ -54,12 +54,25 @@ def require_columns(df: pd.DataFrame, required: list[str], label: str) -> bool:
 
 @st.cache_data(show_spinner=False)
 def load_csv(uploaded_file) -> pd.DataFrame:
-    # Try common encodings safely
+    # Sniff the first line to detect delimiter (Amazon uses tab for many reports)
+    raw = uploaded_file.read(4096)
+    uploaded_file.seek(0)
+    if isinstance(raw, bytes):
+        try:
+            header_line = raw.decode("utf-8").split("\n")[0]
+        except UnicodeDecodeError:
+            header_line = raw.decode("latin-1").split("\n")[0]
+    else:
+        header_line = raw.split("\n")[0]
+
+    # Pick delimiter: if tabs outnumber commas in the header, it's TSV
+    sep = "\t" if header_line.count("\t") > header_line.count(",") else ","
+
     try:
-        df = pd.read_csv(uploaded_file)
+        df = pd.read_csv(uploaded_file, sep=sep)
     except UnicodeDecodeError:
         uploaded_file.seek(0)
-        df = pd.read_csv(uploaded_file, encoding="latin-1")
+        df = pd.read_csv(uploaded_file, sep=sep, encoding="latin-1")
     return df
 
 # =========================
