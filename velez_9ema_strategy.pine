@@ -402,8 +402,10 @@ plotshape(showSignals and emaShort, "ESell", shape.labeldown, location.abovebar,
 // Exit: single small X, no text spam
 anyExit = emaCrossExit or push3Exit or stopHit or eodExit
 exitColor = stopHit ? color.red : push3Exit ? color.orange : eodExit ? color.gray : #FFD600
-plotshape(showSignals and anyExit, "Exit", shape.xcross,
-     longActive[1] or (not shortActive[1] and strategy.position_size[1] > 0) ? location.abovebar : location.belowbar,
+wasLong  = longActive[1] or (not shortActive[1] and strategy.position_size[1] > 0)
+plotshape(showSignals and anyExit and wasLong, "Exit Long", shape.xcross, location.abovebar,
+     color.new(exitColor, 0), size=size.tiny)
+plotshape(showSignals and anyExit and not wasLong, "Exit Short", shape.xcross, location.belowbar,
      color.new(exitColor, 0), size=size.tiny)
 
 // Stop/trail line
