@@ -1,20 +1,28 @@
 // =============================================================================
-// Oliver Velez - First 20 Minutes + 9 EMA Strategy (v5 - Clean)
+// Oliver Velez - First 20 Minutes + 9 EMA Strategy (v6 - Refined)
 // =============================================================================
 //
+// FIXES from v5:
+//   - ATR-based stops instead of fixed $0.01 (no more instant stop-outs)
+//   - Cooldown after exits prevents whipsaw re-entry
+//   - Trend filter: 9 EMA signals only trade WITH the 20/200 SMA direction
+//   - Minimum candle body required on EMA cross (filters noise candles)
+//   - Cleaner visuals: background shading for active trades, fewer labels
+//   - Volume confirmation option for EMA entries
+//
 // SIGNAL 1 — VELEZ OPEN (first 20 min):
-//   Narrow state (20 SMA ≈ 200 SMA) + power bar above/below MAs
+//   Narrow state (20 SMA near 200 SMA) + power bar above/below MAs
 //   Enter on Bar 2 breakout, stop under Bar 1
 //
-// SIGNAL 2 — 9 EMA (all day):
-//   BUY when candle closes above 9 EMA
-//   SELL when candle closes below 9 EMA
-//   Exit when candle crosses back through 9 EMA
+// SIGNAL 2 — 9 EMA (all day, filtered):
+//   BUY when candle closes above 9 EMA + trend aligned + body filter
+//   SELL when candle closes below 9 EMA + trend aligned + body filter
+//   Exit on cross back through 9 EMA or ATR trailing stop
 //
 // TIMEFRAME: 2-MINUTE chart
 // =============================================================================
 //@version=5
-strategy("Velez + 9 EMA v5",
+strategy("Velez + 9 EMA v6",
      overlay=true,
      initial_capital=50000,
      default_qty_type=strategy.percent_of_equity,
@@ -24,38 +32,56 @@ strategy("Velez + 9 EMA v5",
      slippage=1,
      process_orders_on_close=false,
      calc_on_every_tick=false)
+
 // =============================================================================
 // INPUTS
 // =============================================================================
-grp_time = "⏰ Session & Timing"
+grp_time = "Session & Timing"
 sessionStart    = input.session("0930-0950", "Velez Window (ET)", group=grp_time)
 mktHours        = input.session("0930-1550", "Market Hours (ET)", group=grp_time)
 closeTime       = input.session("1550-1600", "Force Close Window", group=grp_time)
-grp_ma = "📊 Moving Averages"
+
+grp_ma = "Moving Averages"
 maShortLen   = input.int(20, "Short SMA Length", minval=5, maxval=50, group=grp_ma)
 maLongLen    = input.int(200, "Long SMA Length", minval=50, maxval=500, group=grp_ma)
 narrowThresh = input.float(0.3, "Narrow State Threshold (%)", minval=0.05, maxval=2.0, step=0.05, group=grp_ma)
 emaLen       = input.int(9, "EMA Length", minval=3, maxval=50, group=grp_ma)
-grp_bars = "🐘 Power Bar Detection"
+
+grp_bars = "Power Bar Detection"
 elephantMult = input.float(1.5, "Elephant Bar Multiplier", minval=1.1, maxval=3.0, step=0.1, group=grp_bars)
 tailRatio    = input.float(0.5, "Tail Bar Wick Ratio", minval=0.3, maxval=0.8, step=0.05, group=grp_bars)
 lookbackBars = input.int(20, "Bar Size Lookback", minval=5, maxval=50, group=grp_bars)
-grp_signals = "📡 Signal Selection"
-useVelezOpen = input.bool(true, "Enable Velez Open Signal", group=grp_signals,
-     tooltip="Original strategy: narrow state + power bar in first 20 minutes")
-useEMASignal = input.bool(true, "Enable 9 EMA Signal", group=grp_signals,
-     tooltip="Buy on candle close above 9 EMA, sell on close below. Exit on cross back.")
+
+grp_signals = "Signal Selection"
+useVelezOpen = input.bool(true, "Enable Velez Open Signal", group=grp_signals)
+useEMASignal = input.bool(true, "Enable 9 EMA Signal", group=grp_signals)
 emaOnlyInMarket = input.bool(true, "9 EMA Only During Market Hours", group=grp_signals)
-grp_trade = "💰 Trade Settings"
-entryOffset    = input.float(0.01, "Entry Offset ($)", minval=0.01, maxval=0.50, step=0.01, group=grp_trade)
-velezStopBar1  = input.bool(true, "Velez: Stop Under Bar 1", group=grp_trade)
-useTrailingStop = input.bool(true, "Enable Fat Bar Trailing Stop", group=grp_trade)
-useColorStop   = input.bool(true, "Enable Color Stop", group=grp_trade)
-usePushExit    = input.bool(true, "Enable 3-Push Exit", group=grp_trade)
-grp_visual = "🎨 Visuals"
+
+grp_filter = "Signal Filters"
+useTrendFilter  = input.bool(true, "EMA: Require Trend Alignment", group=grp_filter,
+     tooltip="Only take 9 EMA longs when price is above 20 SMA, shorts when below")
+minBodyATR      = input.float(0.3, "EMA: Min Candle Body (x ATR)", minval=0.0, maxval=1.5, step=0.1, group=grp_filter,
+     tooltip="Candle body must be at least this fraction of ATR to confirm EMA cross. 0 = disabled.")
+cooldownBars    = input.int(5, "Cooldown After Exit (bars)", minval=0, maxval=30, group=grp_filter,
+     tooltip="Wait this many bars after an exit before allowing a new EMA entry")
+useVolFilter    = input.bool(false, "EMA: Require Above-Avg Volume", group=grp_filter,
+     tooltip="Only enter EMA trades when volume exceeds its 20-bar average")
+
+grp_trade = "Trade Settings"
+atrLen          = input.int(14, "ATR Length (for stops)", minval=5, maxval=50, group=grp_trade)
+stopATRMult     = input.float(1.5, "Stop Distance (x ATR)", minval=0.5, maxval=5.0, step=0.25, group=grp_trade)
+velezStopBar1   = input.bool(true, "Velez: Stop Under Bar 1", group=grp_trade)
+useTrailingStop = input.bool(true, "Enable ATR Trailing Stop", group=grp_trade)
+trailATRMult    = input.float(2.0, "Trail Distance (x ATR)", minval=0.5, maxval=5.0, step=0.25, group=grp_trade)
+usePushExit     = input.bool(true, "Enable 3-Push Exit", group=grp_trade)
+
+grp_visual = "Visuals"
 showMAs      = input.bool(true, "Show 20/200 SMAs", group=grp_visual)
 showEMA      = input.bool(true, "Show 9 EMA", group=grp_visual)
-showSignals  = input.bool(true, "Show Entry/Exit Signals", group=grp_visual)
+showSignals  = input.bool(true, "Show Entry/Exit Labels", group=grp_visual)
+showBgShade  = input.bool(true, "Show Trade Background Shading", group=grp_visual)
+showStopLine = input.bool(true, "Show Stop/Trail Line", group=grp_visual)
+
 // =============================================================================
 // TIME
 // =============================================================================
@@ -63,24 +89,32 @@ inOpenWindow  = not na(time(timeframe.period, sessionStart, "America/New_York"))
 inMarketHours = not na(time(timeframe.period, mktHours, "America/New_York"))
 inCloseWindow = not na(time(timeframe.period, closeTime, "America/New_York"))
 isNewDay      = ta.change(time("D")) != 0
+
 var bool firstBarComplete = false
 var int  barsInSession = 0
+
 if isNewDay
     firstBarComplete := false
     barsInSession := 0
+
 if inOpenWindow
     barsInSession += 1
     if barsInSession >= 2
         firstBarComplete := true
+
 // =============================================================================
-// MOVING AVERAGES
+// INDICATORS
 // =============================================================================
 maShort = ta.sma(close, maShortLen)
 maLong  = ta.sma(close, maLongLen)
 ema9    = ta.ema(close, emaLen)
+atrVal  = ta.atr(atrLen)
+avgVol  = ta.sma(volume, 20)
+
 plot(showMAs ? maShort : na, "20 SMA", color=color.new(color.blue, 0), linewidth=2)
 plot(showMAs ? maLong : na, "200 SMA", color=color.new(color.orange, 0), linewidth=2)
 plot(showEMA ? ema9 : na, "9 EMA", color=color.new(#FFD600, 0), linewidth=2)
+
 // =============================================================================
 // STATE DETECTION
 // =============================================================================
@@ -88,25 +122,34 @@ maDistancePct = math.abs(maShort - maLong) / maLong * 100
 isNarrow = maDistancePct <= narrowThresh
 aboveMAs = close > maShort and close > maLong
 belowMAs = close < maShort and close < maLong
+
+// Trend direction for EMA filter
+bullTrend = close > maShort
+bearTrend = close < maShort
+
 // =============================================================================
 // BAR CLASSIFICATION
 // =============================================================================
 barRange    = high - low
 bodySize    = math.abs(close - open)
 avgBarRange = ta.sma(barRange, lookbackBars)
-isGreen     = close > open
-isRed       = close < open
-isDoji      = close == open
+
+isGreen = close > open
+isRed   = close < open
+isDoji  = close == open
+
 lowerWick = math.min(open, close) - low
 upperWick = high - math.max(open, close)
+
 isElephantGreen = isGreen and bodySize > (avgBarRange * elephantMult) and barRange > 0 and (bodySize / barRange) > 0.6
 isElephantRed   = isRed and bodySize > (avgBarRange * elephantMult) and barRange > 0 and (bodySize / barRange) > 0.6
+
 isBottomingTail = barRange > 0 and (lowerWick / barRange) >= tailRatio and bodySize < barRange * 0.4
 isToppingTail   = barRange > 0 and (upperWick / barRange) >= tailRatio and bodySize < barRange * 0.4
+
 bullishPowerBar = isElephantGreen or isBottomingTail
 bearishPowerBar = isElephantRed or isToppingTail
-isFatGreen = isGreen and bodySize > (avgBarRange * 1.2)
-isFatRed   = isRed and bodySize > (avgBarRange * 1.2)
+
 // =============================================================================
 // FIRST BAR TRACKING (Velez open)
 // =============================================================================
@@ -114,16 +157,19 @@ var float firstBarHigh = na
 var float firstBarLow  = na
 var bool  fb_bullish = false
 var bool  fb_bearish = false
+
 if isNewDay
     firstBarHigh := na
     firstBarLow := na
     fb_bullish := false
     fb_bearish := false
+
 if inOpenWindow and barsInSession == 1
     firstBarHigh := high
     firstBarLow  := low
     fb_bullish := isNarrow and aboveMAs and (isGreen or bullishPowerBar)
     fb_bearish := isNarrow and belowMAs and (isRed or bearishPowerBar)
+
 // =============================================================================
 // TRADE STATE
 // =============================================================================
@@ -135,7 +181,8 @@ var float trailStop    = na
 var int   pushCount    = 0
 var float lastPushHigh = na
 var float lastPushLow  = na
-var bool  addTriggered = false
+var int   barsSinceExit = 100     // start high so first trade isn't blocked
+
 if isNewDay
     longActive   := false
     shortActive  := false
@@ -145,13 +192,23 @@ if isNewDay
     pushCount    := 0
     lastPushHigh := na
     lastPushLow  := na
-    addTriggered := false
-noPosition = not longActive and not shortActive
+    barsSinceExit := 100
+
+// Count bars since last exit (for cooldown)
+if not longActive and not shortActive
+    barsSinceExit += 1
+
+noPosition  = not longActive and not shortActive
+cooldownOk  = barsSinceExit >= cooldownBars
+
 // =============================================================================
 // SIGNAL 1 — VELEZ OPEN ENTRY
 // =============================================================================
+entryOffset = atrVal * 0.1  // small offset scaled to volatility
+
 velezLong = useVelezOpen and inOpenWindow and firstBarComplete and noPosition
      and fb_bullish and high > (firstBarHigh + entryOffset)
+
 if velezLong
     longActive := true
     tradeSource := 1
@@ -159,12 +216,14 @@ if velezLong
     trailStop := initialStop
     pushCount := 1
     lastPushHigh := high
-    addTriggered := false
-    strategy.entry("Buy", strategy.long)
+    barsSinceExit := 0
+    strategy.entry("VBuy", strategy.long)
     if velezStopBar1
-        strategy.exit("Stop", "Buy", stop=initialStop)
+        strategy.exit("VStop", "VBuy", stop=initialStop)
+
 velezShort = useVelezOpen and inOpenWindow and firstBarComplete and noPosition
      and fb_bearish and low < (firstBarLow - entryOffset)
+
 if velezShort
     shortActive := true
     tradeSource := 1
@@ -172,121 +231,103 @@ if velezShort
     trailStop := initialStop
     pushCount := 1
     lastPushLow := low
-    addTriggered := false
-    strategy.entry("Sell", strategy.short)
+    barsSinceExit := 0
+    strategy.entry("VSell", strategy.short)
     if velezStopBar1
-        strategy.exit("Stop", "Sell", stop=initialStop)
+        strategy.exit("VStop", "VSell", stop=initialStop)
+
 // =============================================================================
-// SIGNAL 2 — 9 EMA ENTRY
+// SIGNAL 2 — 9 EMA ENTRY (with filters)
 // =============================================================================
 emaTimeOk = emaOnlyInMarket ? inMarketHours : true
-// Candle closes above 9 EMA → Buy
-// Must have been below or at EMA on previous bar for a fresh signal
+
+// Fresh cross: close crosses the EMA
 emaCrossUp   = close > ema9 and close[1] <= ema9[1]
 emaCrossDown = close < ema9 and close[1] >= ema9[1]
-emaLong = useEMASignal and emaTimeOk and noPosition and emaCrossUp
+
+// Body filter: candle must show conviction
+bodyOk = minBodyATR == 0.0 or bodySize >= (atrVal * minBodyATR)
+
+// Volume filter
+volOk = useVolFilter ? (volume > avgVol) : true
+
+// Trend filter: only trade with the short-term trend
+trendLongOk  = useTrendFilter ? bullTrend : true
+trendShortOk = useTrendFilter ? bearTrend : true
+
+emaLong = useEMASignal and emaTimeOk and noPosition and cooldownOk
+     and emaCrossUp and bodyOk and volOk and trendLongOk and isGreen
+
 if emaLong
     longActive := true
     tradeSource := 2
-    initialStop := low - entryOffset
+    initialStop := close - (atrVal * stopATRMult)
     trailStop := initialStop
     pushCount := 1
     lastPushHigh := high
-    addTriggered := false
-    strategy.entry("EMA Buy", strategy.long)
-    strategy.exit("EMA Stop", "EMA Buy", stop=initialStop)
-emaShort = useEMASignal and emaTimeOk and noPosition and emaCrossDown
+    barsSinceExit := 0
+    strategy.entry("EBuy", strategy.long)
+    strategy.exit("EStop", "EBuy", stop=initialStop)
+
+emaShort = useEMASignal and emaTimeOk and noPosition and cooldownOk
+     and emaCrossDown and bodyOk and volOk and trendShortOk and isRed
+
 if emaShort
     shortActive := true
     tradeSource := 2
-    initialStop := high + entryOffset
+    initialStop := close + (atrVal * stopATRMult)
     trailStop := initialStop
     pushCount := 1
     lastPushLow := low
-    addTriggered := false
-    strategy.entry("EMA Sell", strategy.short)
-    strategy.exit("EMA Stop", "EMA Sell", stop=initialStop)
+    barsSinceExit := 0
+    strategy.entry("ESell", strategy.short)
+    strategy.exit("EStop", "ESell", stop=initialStop)
+
 // =============================================================================
 // 9 EMA EXIT — candle crosses back through EMA
 // =============================================================================
 var bool emaCrossExit = false
 emaCrossExit := false
-// Long: exit when candle closes below 9 EMA
+
 if longActive and tradeSource == 2 and strategy.position_size > 0
-    if close < ema9
+    if close < ema9 and isRed  // require a red close below, not just a wick
         emaCrossExit := true
-        strategy.close_all(comment="EMA Cross Exit")
+        strategy.close_all(comment="EMA Exit")
         longActive := false
         pushCount := 0
-// Short: exit when candle closes above 9 EMA
+        barsSinceExit := 0
+
 if shortActive and tradeSource == 2 and strategy.position_size < 0
-    if close > ema9
+    if close > ema9 and isGreen  // require a green close above
         emaCrossExit := true
-        strategy.close_all(comment="EMA Cross Exit")
+        strategy.close_all(comment="EMA Exit")
         shortActive := false
         pushCount := 0
+        barsSinceExit := 0
+
 // =============================================================================
-// VELEZ EXITS — trailing stop, color stop, 3-push (only for velez trades)
+// ATR TRAILING STOP (replaces fat-bar trailing + color stop)
 // =============================================================================
-// --- Color Game Add (velez trades only) ---
-var bool  sawOppBar = false
-var float oppBarHigh = na
-var float oppBarLow  = na
-if isNewDay
-    sawOppBar := false
-    oppBarHigh := na
-    oppBarLow := na
-if longActive and tradeSource == 1 and strategy.position_size > 0 and not addTriggered
-    if isRed and not sawOppBar
-        sawOppBar := true
-        oppBarHigh := high
-    if sawOppBar and isGreen and high > oppBarHigh + entryOffset
-        addTriggered := true
-        strategy.entry("Add", strategy.long)
-if shortActive and tradeSource == 1 and strategy.position_size < 0 and not addTriggered
-    if isGreen and not sawOppBar
-        sawOppBar := true
-        oppBarLow := low
-    if sawOppBar and isRed and low < oppBarLow - entryOffset
-        addTriggered := true
-        strategy.entry("Add", strategy.short)
-// --- Fat Bar Trailing Stop ---
 if longActive and strategy.position_size > 0 and useTrailingStop
-    if isFatGreen
-        newStop = low - entryOffset
-        if newStop > trailStop
-            trailStop := newStop
-            strategy.exit("Trail", "Buy", stop=trailStop)
-            strategy.exit("Trail A", "Add", stop=trailStop)
-            strategy.exit("Trail E", "EMA Buy", stop=trailStop)
+    newTrail = close - (atrVal * trailATRMult)
+    if newTrail > trailStop
+        trailStop := newTrail
+        strategy.exit("Trail", "VBuy", stop=trailStop)
+        strategy.exit("TrailE", "EBuy", stop=trailStop)
+
 if shortActive and strategy.position_size < 0 and useTrailingStop
-    if isFatRed
-        newStop = high + entryOffset
-        if newStop < trailStop
-            trailStop := newStop
-            strategy.exit("Trail", "Sell", stop=trailStop)
-            strategy.exit("Trail A", "Add", stop=trailStop)
-            strategy.exit("Trail E", "EMA Sell", stop=trailStop)
-// --- Color Stop ---
-if longActive and strategy.position_size > 0 and useColorStop
-    if isGreen and isGreen[1] and isRed[2]
-        cs = low[2] - entryOffset
-        if cs > trailStop
-            trailStop := cs
-            strategy.exit("CStop", "Buy", stop=trailStop)
-            strategy.exit("CStop A", "Add", stop=trailStop)
-            strategy.exit("CStop E", "EMA Buy", stop=trailStop)
-if shortActive and strategy.position_size < 0 and useColorStop
-    if isRed and isRed[1] and isGreen[2]
-        cs = high[2] + entryOffset
-        if cs < trailStop
-            trailStop := cs
-            strategy.exit("CStop", "Sell", stop=trailStop)
-            strategy.exit("CStop A", "Add", stop=trailStop)
-            strategy.exit("CStop E", "EMA Sell", stop=trailStop)
-// --- 3-Push Exit ---
+    newTrail = close + (atrVal * trailATRMult)
+    if newTrail < trailStop
+        trailStop := newTrail
+        strategy.exit("Trail", "VSell", stop=trailStop)
+        strategy.exit("TrailE", "ESell", stop=trailStop)
+
+// =============================================================================
+// 3-PUSH EXIT
+// =============================================================================
 var bool push3Exit = false
 push3Exit := false
+
 if longActive and strategy.position_size > 0 and usePushExit
     if high > lastPushHigh and isGreen and (isRed[1] or isRed[2] or isDoji[1])
         pushCount += 1
@@ -296,6 +337,8 @@ if longActive and strategy.position_size > 0 and usePushExit
         strategy.close_all(comment="3-Push")
         longActive := false
         pushCount := 0
+        barsSinceExit := 0
+
 if shortActive and strategy.position_size < 0 and usePushExit
     if low < lastPushLow and isRed and (isGreen[1] or isGreen[2] or isDoji[1])
         pushCount += 1
@@ -305,96 +348,101 @@ if shortActive and strategy.position_size < 0 and usePushExit
         strategy.close_all(comment="3-Push")
         shortActive := false
         pushCount := 0
+        barsSinceExit := 0
+
 // =============================================================================
 // EOD CLOSE
 // =============================================================================
 var bool eodExit = false
 eodExit := false
+
 if inCloseWindow and strategy.position_size != 0
     eodExit := true
     strategy.close_all(comment="EOD")
     longActive  := false
     shortActive := false
     pushCount   := 0
+    barsSinceExit := 0
+
 // =============================================================================
 // DETECT STOP HITS
 // =============================================================================
 var bool stopHit = false
 stopHit := false
+
 if longActive and strategy.position_size == 0 and not push3Exit and not emaCrossExit and not eodExit
     stopHit := true
     longActive := false
     pushCount := 0
+    barsSinceExit := 0
+
 if shortActive and strategy.position_size == 0 and not push3Exit and not emaCrossExit and not eodExit
     stopHit := true
     shortActive := false
     pushCount := 0
+    barsSinceExit := 0
+
 // =============================================================================
-// VISUALS — CLEAN & MINIMAL
+// VISUALS — CLEAN
 // =============================================================================
-// --- Entry signals ---
-// Velez entries: green/red labels
-plotshape(showSignals and velezLong, "Velez Buy", shape.labelup, location.belowbar,
-     color.new(#00C853, 0), text="BUY", textcolor=color.white, size=size.small)
-plotshape(showSignals and velezShort, "Velez Sell", shape.labeldown, location.abovebar,
-     color.new(#FF1744, 0), text="SELL", textcolor=color.white, size=size.small)
-// EMA entries: gold labels
-plotshape(showSignals and emaLong, "EMA Buy", shape.labelup, location.belowbar,
-     color.new(#FFD600, 0), text="EMA↑", textcolor=color.black, size=size.small)
-plotshape(showSignals and emaShort, "EMA Sell", shape.labeldown, location.abovebar,
-     color.new(#FF6D00, 0), text="EMA↓", textcolor=color.white, size=size.small)
-// --- Exit signals ---
-plotshape(showSignals and emaCrossExit, "EMA Exit", shape.xcross, location.abovebar,
-     color.new(#FFD600, 0), size=size.small, text="X", textcolor=color.black)
-plotshape(showSignals and push3Exit, "3-Push", shape.xcross, location.abovebar,
-     color.new(#FF9800, 0), size=size.small, text="3P", textcolor=color.white)
-plotshape(showSignals and stopHit, "Stop", shape.xcross, location.belowbar,
-     color.new(color.red, 0), size=size.small, text="STP", textcolor=color.white)
-plotshape(showSignals and eodExit, "EOD", shape.xcross, location.abovebar,
-     color.new(color.gray, 0), size=size.small, text="EOD", textcolor=color.white)
-// --- Add signal ---
-plotshape(showSignals and addTriggered and longActive and sawOppBar,
-     "Add Long", shape.triangleup, location.belowbar, color.new(color.blue, 0), size=size.tiny, text="ADD")
-plotshape(showSignals and addTriggered and shortActive and sawOppBar,
-     "Add Short", shape.triangledown, location.abovebar, color.new(color.purple, 0), size=size.tiny, text="ADD")
-// --- Trailing stop line ---
-plot(longActive and strategy.position_size > 0 ? trailStop : na, "Long Trail",
-     color=color.new(color.red, 30), style=plot.style_steplinebr, linewidth=2)
-plot(shortActive and strategy.position_size < 0 ? trailStop : na, "Short Trail",
-     color=color.new(color.green, 30), style=plot.style_steplinebr, linewidth=2)
+// Background shading: green tint when long, red tint when short
+bgcolor(showBgShade and longActive and strategy.position_size > 0 ? color.new(#00C853, 92) : na)
+bgcolor(showBgShade and shortActive and strategy.position_size < 0 ? color.new(#FF1744, 92) : na)
+
+// Entry labels only (minimal)
+plotshape(showSignals and velezLong, "VBuy", shape.labelup, location.belowbar,
+     color.new(#00C853, 0), text="V", textcolor=color.white, size=size.tiny)
+plotshape(showSignals and velezShort, "VSell", shape.labeldown, location.abovebar,
+     color.new(#FF1744, 0), text="V", textcolor=color.white, size=size.tiny)
+plotshape(showSignals and emaLong, "EBuy", shape.labelup, location.belowbar,
+     color.new(#2196F3, 0), text="E", textcolor=color.white, size=size.tiny)
+plotshape(showSignals and emaShort, "ESell", shape.labeldown, location.abovebar,
+     color.new(#FF6D00, 0), text="E", textcolor=color.white, size=size.tiny)
+
+// Exit: single small X, no text spam
+anyExit = emaCrossExit or push3Exit or stopHit or eodExit
+exitColor = stopHit ? color.red : push3Exit ? color.orange : eodExit ? color.gray : #FFD600
+plotshape(showSignals and anyExit, "Exit", shape.xcross,
+     longActive[1] or (not shortActive[1] and strategy.position_size[1] > 0) ? location.abovebar : location.belowbar,
+     color.new(exitColor, 0), size=size.tiny)
+
+// Stop/trail line
+plot(showStopLine and longActive and strategy.position_size > 0 ? trailStop : na, "Stop Line",
+     color=color.new(color.red, 30), style=plot.style_steplinebr, linewidth=1)
+plot(showStopLine and shortActive and strategy.position_size < 0 ? trailStop : na, "Stop Line",
+     color=color.new(color.green, 30), style=plot.style_steplinebr, linewidth=1)
+
 // =============================================================================
 // INFO TABLE (compact)
 // =============================================================================
-var table info = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80),
+var table info = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 80),
      border_width=1, border_color=color.gray)
+
 if barstate.islast
-    stateText  = isNarrow ? "NARROW" : "WIDE/TRANS"
+    stateText  = isNarrow ? "NARROW" : "WIDE"
     tradeText  = longActive ? "LONG" : shortActive ? "SHORT" : "FLAT"
-    srcText    = tradeSource == 1 ? "Velez" : tradeSource == 2 ? "9 EMA" : "—"
+    srcText    = tradeSource == 1 ? "Velez" : tradeSource == 2 ? "EMA" : "---"
     tradeColor = longActive ? color.lime : shortActive ? color.red : color.gray
-    emaRelText = close > ema9 ? "Above 9 EMA" : close < ema9 ? "Below 9 EMA" : "At 9 EMA"
 
     table.cell(info, 0, 0, "State", text_color=color.white, text_size=size.small)
     table.cell(info, 1, 0, stateText, text_color=isNarrow ? color.lime : color.orange, text_size=size.small)
-    table.cell(info, 0, 1, "9 EMA", text_color=color.white, text_size=size.small)
-    table.cell(info, 1, 1, emaRelText, text_color=close > ema9 ? color.lime : color.red, text_size=size.small)
-    table.cell(info, 0, 2, "Trade", text_color=color.white, text_size=size.small)
-    table.cell(info, 1, 2, tradeText, text_color=tradeColor, text_size=size.small)
-    table.cell(info, 0, 3, "Source", text_color=color.white, text_size=size.small)
-    table.cell(info, 1, 3, srcText, text_color=color.white, text_size=size.small)
-    table.cell(info, 0, 4, "Pushes", text_color=color.white, text_size=size.small)
-    table.cell(info, 1, 4, str.tostring(pushCount) + "/3", text_color=color.white, text_size=size.small)
-    table.cell(info, 0, 5, "Stop", text_color=color.white, text_size=size.small)
-    table.cell(info, 1, 5, str.tostring(initialStop, "#.##"), text_color=color.red, text_size=size.small)
-    table.cell(info, 0, 6, "Trail", text_color=color.white, text_size=size.small)
-    table.cell(info, 1, 6, str.tostring(trailStop, "#.##"), text_color=color.yellow, text_size=size.small)
+    table.cell(info, 0, 1, "Trade", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 1, tradeText + " (" + srcText + ")", text_color=tradeColor, text_size=size.small)
+    table.cell(info, 0, 2, "Pushes", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 2, str.tostring(pushCount) + "/3", text_color=color.white, text_size=size.small)
+    table.cell(info, 0, 3, "Stop", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 3, str.tostring(trailStop, "#.##"), text_color=color.red, text_size=size.small)
+    table.cell(info, 0, 4, "ATR", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 4, str.tostring(atrVal, "#.##"), text_color=color.yellow, text_size=size.small)
+    table.cell(info, 0, 5, "Cooldown", text_color=color.white, text_size=size.small)
+    table.cell(info, 1, 5, cooldownOk ? "Ready" : str.tostring(cooldownBars - barsSinceExit) + " bars",
+         text_color=cooldownOk ? color.lime : color.orange, text_size=size.small)
+
 // =============================================================================
 // ALERTS
 // =============================================================================
 alertcondition(velezLong, "Velez Buy", "Velez: BUY signal")
 alertcondition(velezShort, "Velez Sell", "Velez: SELL signal")
-alertcondition(emaLong, "EMA Buy", "9 EMA: BUY signal — candle closed above EMA")
-alertcondition(emaShort, "EMA Sell", "9 EMA: SELL signal — candle closed below EMA")
-alertcondition(emaCrossExit, "EMA Exit", "9 EMA: Exit — candle crossed back")
-alertcondition(push3Exit, "3-Push Exit", "3-Push exit triggered")
-alertcondition(stopHit, "Stop Hit", "Stop loss hit")
+alertcondition(emaLong, "EMA Buy", "9 EMA: BUY signal")
+alertcondition(emaShort, "EMA Sell", "9 EMA: SELL signal")
+alertcondition(anyExit, "Trade Exit", "Trade exited")
